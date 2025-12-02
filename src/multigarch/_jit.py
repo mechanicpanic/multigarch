@@ -174,7 +174,7 @@ def dcc_covariance_loop(
     Q_bar: np.ndarray,
     a: float,
     b: float,
-) -> tuple[np.ndarray, np.ndarray]:
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Compute DCC correlation and covariance paths.
 
     Args:
@@ -219,7 +219,7 @@ def dcc_covariance_loop(
             for j in range(n):
                 H[t, i, j] = sigmas[t, i] * R[t, i, j] * sigmas[t, j]
 
-    return R, H
+    return R, H, Q
 
 
 @njit(cache=True)
@@ -229,7 +229,7 @@ def dcc_final_covariance(
     Q_bar: np.ndarray,
     a: float,
     b: float,
-) -> tuple[np.ndarray, np.ndarray]:
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Compute only the final DCC correlation and covariance matrices.
 
     Memory-efficient version that doesn't store the full path.
@@ -269,4 +269,4 @@ def dcc_final_covariance(
         for j in range(n):
             H_final[i, j] = sigmas[-1, i] * R_final[i, j] * sigmas[-1, j]
 
-    return R_final, H_final
+    return R_final, H_final, Q

@@ -259,6 +259,7 @@ class DCC:
         self.Q_bar: NDArray[np.float64] | None = None
         self.R: NDArray[np.float64] | None = None  # (n,n) if low_memory else (T,n,n)
         self.H: NDArray[np.float64] | None = None  # (n,n) if low_memory else (T,n,n)
+        self.Q_last: NDArray[np.float64] | None = None  # Final Q_t for forecasting
         self._n_assets: int = 0
         self._T: int = 0
 
@@ -307,11 +308,11 @@ class DCC:
 
         # Compute covariance matrices
         if self.low_memory:
-            self.R, self.H = dcc_final_covariance(
+            self.R, self.H, self.Q_last = dcc_final_covariance(
                 std_resid, sigmas, self.Q_bar, self.a, self.b
             )
         else:
-            self.R, self.H = dcc_covariance_loop(
+            self.R, self.H, self.Q_last = dcc_covariance_loop(
                 std_resid, sigmas, self.Q_bar, self.a, self.b
             )
 
@@ -329,6 +330,9 @@ class DCC:
         if self.H is None:
             raise ValueError("Model not fitted")
 
+        if self.Q_bar is None or self.Q_last is None:
+            raise ValueError("Missing DCC state for forecasting")
+
         n = self._n_assets
         forecasts = np.zeros((horizon, n, n))
 
@@ -336,11 +340,17 @@ class DCC:
         for i, garch in enumerate(self.garch_models):
             var_forecasts[:, i] = garch.forecast(horizon)
 
-        # In low_memory mode, R is (n,n); otherwise (T,n,n)
-        R_forecast = self.R.copy() if self.low_memory else self.R[-1].copy()
+        # Forecast Q_t using expected shock term E[εε'] = Q̄
+        Q_forecast = self.Q_last.copy()
+        one_minus_b = 1.0 - self.b
 
         for h in range(horizon):
-            R_forecast = (1 - self.a - self.b) * self.Q_bar + (self.a + self.b) * R_forecast
+            Q_forecast = one_minus_b * self.Q_bar + self.b * Q_forecast
+
+            # Normalize to correlation
+            Q_diag = np.diag(Q_forecast)
+            inv_sqrt = np.diag(1.0 / np.sqrt(Q_diag))
+            R_forecast = inv_sqrt @ Q_forecast @ inv_sqrt
 
             D = np.diag(np.sqrt(var_forecasts[h]))
             forecasts[h] = D @ R_forecast @ D
