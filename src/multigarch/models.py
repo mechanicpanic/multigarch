@@ -9,6 +9,7 @@ from scipy.optimize import minimize
 
 from multigarch._jit import (
     dcc_covariance_loop,
+    dcc_final_covariance,
     dcc_loglik_loop,
     garch_loglik,
     garch_variance_loop,
@@ -130,20 +131,24 @@ class CCC:
     where D_t = diag(σ_{1,t}, ..., σ_{n,t}) and R is constant.
     """
 
-    def __init__(self, p: int = 1, q: int = 1, n_jobs: int = -1) -> None:
+    def __init__(
+        self, p: int = 1, q: int = 1, n_jobs: int = -1, low_memory: bool = False
+    ) -> None:
         """Initialize CCC-GARCH model.
 
         Args:
             p: ARCH order for univariate GARCH models
             q: GARCH order for univariate GARCH models
             n_jobs: Number of parallel jobs for GARCH fitting (-1 = all cores)
+            low_memory: If True, only store final covariance matrix (not full path)
         """
         self.p = p
         self.q = q
         self.n_jobs = n_jobs
+        self.low_memory = low_memory
         self.garch_models: list[GARCH] = []
         self.R: NDArray[np.float64] | None = None  # Constant correlation
-        self.H: NDArray[np.float64] | None = None  # Time-varying covariances
+        self.H: NDArray[np.float64] | None = None  # Covariances (final or path)
         self._n_assets: int = 0
         self._T: int = 0
 
@@ -181,11 +186,16 @@ class CCC:
         if n == 1:
             self.R = np.array([[1.0]])
 
-        # Compute covariance path: H_t = D_t @ R @ D_t
-        self.H = np.zeros((T, n, n))
-        for t in range(T):
-            D = np.diag(sigmas[t])
-            self.H[t] = D @ self.R @ D
+        if self.low_memory:
+            # Only store final covariance matrix
+            D = np.diag(sigmas[-1])
+            self.H = D @ self.R @ D  # shape: (n, n)
+        else:
+            # Store full covariance path
+            self.H = np.zeros((T, n, n))
+            for t in range(T):
+                D = np.diag(sigmas[t])
+                self.H[t] = D @ self.R @ D
 
         return self
 
@@ -228,23 +238,27 @@ class DCC:
                R_t = diag(Q_t)^{-1/2} * Q_t * diag(Q_t)^{-1/2}
     """
 
-    def __init__(self, p: int = 1, q: int = 1, n_jobs: int = -1) -> None:
+    def __init__(
+        self, p: int = 1, q: int = 1, n_jobs: int = -1, low_memory: bool = False
+    ) -> None:
         """Initialize DCC-GARCH model.
 
         Args:
             p: ARCH order for univariate GARCH models
             q: GARCH order for univariate GARCH models
             n_jobs: Number of parallel jobs for GARCH fitting (-1 = all cores)
+            low_memory: If True, only store final covariance/correlation matrices
         """
         self.p = p
         self.q = q
         self.n_jobs = n_jobs
+        self.low_memory = low_memory
         self.garch_models: list[GARCH] = []
         self.a: float | None = None
         self.b: float | None = None
         self.Q_bar: NDArray[np.float64] | None = None
-        self.R: NDArray[np.float64] | None = None
-        self.H: NDArray[np.float64] | None = None
+        self.R: NDArray[np.float64] | None = None  # (n,n) if low_memory else (T,n,n)
+        self.H: NDArray[np.float64] | None = None  # (n,n) if low_memory else (T,n,n)
         self._n_assets: int = 0
         self._T: int = 0
 
@@ -291,8 +305,15 @@ class DCC:
         result = minimize(neg_log_likelihood, x0, method="L-BFGS-B", bounds=bounds)
         self.a, self.b = result.x
 
-        # Compute covariance path
-        self.R, self.H = dcc_covariance_loop(std_resid, sigmas, self.Q_bar, self.a, self.b)
+        # Compute covariance matrices
+        if self.low_memory:
+            self.R, self.H = dcc_final_covariance(
+                std_resid, sigmas, self.Q_bar, self.a, self.b
+            )
+        else:
+            self.R, self.H = dcc_covariance_loop(
+                std_resid, sigmas, self.Q_bar, self.a, self.b
+            )
 
         return self
 
@@ -315,7 +336,8 @@ class DCC:
         for i, garch in enumerate(self.garch_models):
             var_forecasts[:, i] = garch.forecast(horizon)
 
-        R_forecast = self.R[-1].copy()
+        # In low_memory mode, R is (n,n); otherwise (T,n,n)
+        R_forecast = self.R.copy() if self.low_memory else self.R[-1].copy()
 
         for h in range(horizon):
             R_forecast = (1 - self.a - self.b) * self.Q_bar + (self.a + self.b) * R_forecast

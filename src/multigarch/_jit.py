@@ -220,3 +220,53 @@ def dcc_covariance_loop(
                 H[t, i, j] = sigmas[t, i] * R[t, i, j] * sigmas[t, j]
 
     return R, H
+
+
+@njit(cache=True)
+def dcc_final_covariance(
+    std_resid: np.ndarray,
+    sigmas: np.ndarray,
+    Q_bar: np.ndarray,
+    a: float,
+    b: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Compute only the final DCC correlation and covariance matrices.
+
+    Memory-efficient version that doesn't store the full path.
+
+    Args:
+        std_resid: Standardized residuals (T, n)
+        sigmas: Conditional standard deviations (T, n)
+        Q_bar: Unconditional correlation matrix
+        a: DCC a parameter
+        b: DCC b parameter
+
+    Returns:
+        Tuple of (R_final, H_final) arrays of shape (n, n)
+    """
+    T, n = std_resid.shape
+
+    Q = Q_bar.copy()
+    one_minus_ab = 1.0 - a - b
+
+    for t in range(1, T):
+        eps = std_resid[t - 1, :].reshape(-1, 1)
+        Q = one_minus_ab * Q_bar + a * (eps @ eps.T) + b * Q
+
+    # Final correlation matrix
+    R_final = np.zeros((n, n))
+    Q_diag_inv_sqrt = np.zeros(n)
+    for i in range(n):
+        Q_diag_inv_sqrt[i] = 1.0 / np.sqrt(Q[i, i])
+
+    for i in range(n):
+        for j in range(n):
+            R_final[i, j] = Q[i, j] * Q_diag_inv_sqrt[i] * Q_diag_inv_sqrt[j]
+
+    # Final covariance matrix
+    H_final = np.zeros((n, n))
+    for i in range(n):
+        for j in range(n):
+            H_final[i, j] = sigmas[-1, i] * R_final[i, j] * sigmas[-1, j]
+
+    return R_final, H_final
