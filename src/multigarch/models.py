@@ -32,9 +32,47 @@ def _check_fitted(is_fitted: bool) -> None:
         raise ValueError("Model not fitted; call fit() first")
 
 
-def _fit_single_garch(returns: NDArray, p: int, q: int) -> GARCH:
+def _numerical_hessian(f, x: NDArray[np.float64], eps: float = 1e-5) -> NDArray[np.float64]:
+    """Central-difference Hessian of scalar function f at x."""
+    k = len(x)
+    H = np.zeros((k, k))
+    h = eps * np.maximum(np.abs(x), 1.0)
+    for i in range(k):
+        for j in range(i, k):
+            xpp = x.copy()
+            xpp[i] += h[i]
+            xpp[j] += h[j]
+            xpm = x.copy()
+            xpm[i] += h[i]
+            xpm[j] -= h[j]
+            xmp = x.copy()
+            xmp[i] -= h[i]
+            xmp[j] += h[j]
+            xmm = x.copy()
+            xmm[i] -= h[i]
+            xmm[j] -= h[j]
+            H[i, j] = (f(xpp) - f(xpm) - f(xmp) + f(xmm)) / (4.0 * h[i] * h[j])
+            H[j, i] = H[i, j]
+    return H
+
+
+def _se_from_hessian(H: NDArray[np.float64]) -> NDArray[np.float64]:
+    """Standard errors from a Hessian of the negative log-likelihood.
+
+    Returns NaN where the inverse Hessian has non-positive diagonal.
+    """
+    try:
+        cov = np.linalg.inv(H)
+    except np.linalg.LinAlgError:
+        cov = np.linalg.pinv(H)
+    diag = np.diag(cov).copy()
+    diag[diag <= 0] = np.nan
+    return np.sqrt(diag)
+
+
+def _fit_single_garch(returns: NDArray, p: int, q: int, mean: str) -> GARCH:
     """Fit a single GARCH model (helper for parallel fitting)."""
-    return GARCH(p=p, q=q).fit(returns)
+    return GARCH(p=p, q=q, mean=mean).fit(returns)
 
 
 class GARCH:
@@ -48,17 +86,24 @@ class GARCH:
         beta: GARCH coefficients (array of length q)
     """
 
-    def __init__(self, p: int = 1, q: int = 1) -> None:
+    def __init__(self, p: int = 1, q: int = 1, mean: str = "zero") -> None:
         """Initialize GARCH(p,q) model.
 
         Args:
             p: ARCH order (number of lagged squared residuals)
             q: GARCH order (number of lagged variances)
+            mean: "zero" (default) fits raw returns; "constant" demeans
+                first and stores the sample mean as ``mu``
         """
         if p < 1 or q < 1:
             raise ValueError("p and q must be >= 1")
+        if mean not in ("zero", "constant"):
+            raise ValueError(f"mean must be 'zero' or 'constant', got {mean!r}")
         self.p = p
         self.q = q
+        self.mean = mean
+        self.mu: float = 0.0
+        self._std_err: NDArray[np.float64] | None = None
         self.omega: float | None = None
         self.alpha: NDArray[np.float64] | None = None
         self.beta: NDArray[np.float64] | None = None
@@ -81,6 +126,9 @@ class GARCH:
         """
         returns = np.asarray(returns, dtype=np.float64).flatten()
         _validate_returns(returns, min_obs=max(10, self.p + self.q + 2))
+        self._std_err = None
+        self.mu = float(returns.mean()) if self.mean == "constant" else 0.0
+        returns = returns - self.mu
         T = len(returns)
         var0 = float(np.var(returns))
         p, q = self.p, self.q
@@ -122,6 +170,59 @@ class GARCH:
         self.sigma2 = garch_variance_loop(returns, self.omega, self.alpha, self.beta, var0)
 
         return self
+
+    def _objective(self, x: NDArray[np.float64]) -> float:
+        return garch_loglik(self.resid, x[0], x[1 : 1 + self.p], x[1 + self.p :], self._var0)
+
+    @property
+    def _n_params(self) -> int:
+        return 1 + self.p + self.q + (1 if self.mean == "constant" else 0)
+
+    @property
+    def loglik_(self) -> float:
+        """Gaussian log-likelihood at the optimum (includes the 2*pi constant)."""
+        _check_fitted(self.sigma2 is not None)
+        return -self._nll - 0.5 * self._T * np.log(2.0 * np.pi)
+
+    @property
+    def aic(self) -> float:
+        return 2.0 * self._n_params - 2.0 * self.loglik_
+
+    @property
+    def bic(self) -> float:
+        return self._n_params * np.log(self._T) - 2.0 * self.loglik_
+
+    @property
+    def std_err(self) -> NDArray[np.float64]:
+        """Approximate standard errors for (omega, alpha..., beta...).
+
+        Inverse numerical Hessian of the negative log-likelihood at the
+        optimum. NaN where the Hessian is not positive definite. The mean
+        parameter (if any) is excluded.
+        """
+        _check_fitted(self.sigma2 is not None)
+        if self._std_err is None:
+            H = _numerical_hessian(self._objective, self._x_opt)
+            self._std_err = _se_from_hessian(H)
+        return self._std_err
+
+    def summary(self) -> str:
+        """Formatted model summary."""
+        _check_fitted(self.sigma2 is not None)
+        lines = [f"GARCH({self.p}, {self.q})  T={self._T}  mean={self.mean}"]
+        if self.mean == "constant":
+            lines.append(f"  mu:    {self.mu:.6g}")
+        lines.append(f"  omega: {self.omega:.6g}")
+        for i, a in enumerate(self.alpha, 1):
+            lines.append(f"  alpha[{i}]: {a:.4f}")
+        for j, b in enumerate(self.beta, 1):
+            lines.append(f"  beta[{j}]:  {b:.4f}")
+        lines += [
+            f"  persistence: {self.alpha.sum() + self.beta.sum():.4f}",
+            f"  loglik: {self.loglik_:.2f}  AIC: {self.aic:.2f}  BIC: {self.bic:.2f}",
+            f"  converged: {self.converged}",
+        ]
+        return "\n".join(lines)
 
     def forecast(self, horizon: int = 1) -> NDArray[np.float64]:
         """Forecast conditional variance.
@@ -167,7 +268,12 @@ class CCC:
     """
 
     def __init__(
-        self, p: int = 1, q: int = 1, n_jobs: int = -1, low_memory: bool = False
+        self,
+        p: int = 1,
+        q: int = 1,
+        n_jobs: int = -1,
+        low_memory: bool = False,
+        mean: str = "zero",
     ) -> None:
         """Initialize CCC-GARCH model.
 
@@ -176,9 +282,13 @@ class CCC:
             q: GARCH order for univariate GARCH models
             n_jobs: Number of parallel jobs for GARCH fitting (-1 = all cores)
             low_memory: If True, only store final covariance matrix (not full path)
+            mean: mean model for the univariate fits ("zero" or "constant")
         """
+        if mean not in ("zero", "constant"):
+            raise ValueError(f"mean must be 'zero' or 'constant', got {mean!r}")
         self.p = p
         self.q = q
+        self.mean = mean
         self.n_jobs = n_jobs
         self.low_memory = low_memory
         self.garch_models: list[GARCH] = []
@@ -207,7 +317,8 @@ class CCC:
 
         # Fit univariate GARCH models in parallel
         self.garch_models = Parallel(n_jobs=self.n_jobs)(
-            delayed(_fit_single_garch)(returns[:, i], self.p, self.q) for i in range(n)
+            delayed(_fit_single_garch)(returns[:, i], self.p, self.q, self.mean)
+            for i in range(n)
         )
 
         # Compute standardized residuals
@@ -274,7 +385,12 @@ class DCC:
     """
 
     def __init__(
-        self, p: int = 1, q: int = 1, n_jobs: int = -1, low_memory: bool = False
+        self,
+        p: int = 1,
+        q: int = 1,
+        n_jobs: int = -1,
+        low_memory: bool = False,
+        mean: str = "zero",
     ) -> None:
         """Initialize DCC-GARCH model.
 
@@ -283,9 +399,13 @@ class DCC:
             q: GARCH order for univariate GARCH models
             n_jobs: Number of parallel jobs for GARCH fitting (-1 = all cores)
             low_memory: If True, only store final covariance/correlation matrices
+            mean: mean model for the univariate fits ("zero" or "constant")
         """
+        if mean not in ("zero", "constant"):
+            raise ValueError(f"mean must be 'zero' or 'constant', got {mean!r}")
         self.p = p
         self.q = q
+        self.mean = mean
         self.n_jobs = n_jobs
         self.low_memory = low_memory
         self.garch_models: list[GARCH] = []
@@ -318,7 +438,8 @@ class DCC:
 
         # Step 1: Fit univariate GARCH models in parallel
         self.garch_models = Parallel(n_jobs=self.n_jobs)(
-            delayed(_fit_single_garch)(returns[:, i], self.p, self.q) for i in range(n)
+            delayed(_fit_single_garch)(returns[:, i], self.p, self.q, self.mean)
+            for i in range(n)
         )
 
         # Compute standardized residuals

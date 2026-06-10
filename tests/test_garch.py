@@ -46,3 +46,47 @@ def test_sigma2_positive():
     r = simulate_garch(1000, omega=0.05, alpha=0.05, beta=0.90, seed=9)
     m = GARCH(p=2, q=2).fit(r)
     assert np.all(m.sigma2 > 0)
+
+
+def test_mean_constant_recovers_mu():
+    r = simulate_garch(4000, omega=0.05, alpha=0.05, beta=0.90, seed=3) + 1.5
+    m = GARCH(mean="constant").fit(r)
+    assert abs(m.mu - 1.5) < 0.1
+    # residuals are demeaned
+    assert abs(m.resid.mean()) < 1e-10
+
+
+def test_mean_zero_default():
+    r = simulate_garch(1000, omega=0.05, alpha=0.05, beta=0.90, seed=4)
+    m = GARCH().fit(r)
+    assert m.mu == 0.0
+
+
+def test_invalid_mean_raises():
+    with pytest.raises(ValueError, match="mean"):
+        GARCH(mean="arma")
+
+
+def test_diagnostics():
+    r = simulate_garch(1000, omega=0.05, alpha=0.05, beta=0.90, seed=11)
+    m = GARCH().fit(r)
+    assert np.isfinite(m.loglik_)
+    k = 3  # omega, alpha, beta
+    assert m.aic == pytest.approx(2 * k - 2 * m.loglik_)
+    assert m.bic == pytest.approx(k * np.log(1000) - 2 * m.loglik_)
+
+
+def test_std_err():
+    r = simulate_garch(2000, omega=0.05, alpha=0.08, beta=0.88, seed=12)
+    m = GARCH().fit(r)
+    se = m.std_err
+    assert se.shape == (3,)
+    assert np.all((se > 0) | np.isnan(se))
+
+
+def test_summary():
+    r = simulate_garch(1000, omega=0.05, alpha=0.05, beta=0.90, seed=13)
+    m = GARCH().fit(r)
+    s = m.summary()
+    assert "GARCH(1, 1)" in s
+    assert "loglik" in s
