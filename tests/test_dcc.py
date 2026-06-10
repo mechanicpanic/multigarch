@@ -107,6 +107,29 @@ def test_dcc_single_asset():
     assert np.all(np.isfinite(m.H))
 
 
+def test_dcc_diagnostics():
+    returns = simulate_dcc_returns(400, 3, a=0.05, b=0.90, seed=14)
+    m = DCC(n_jobs=1).fit(returns)
+    assert np.isfinite(m.loglik_)
+    k = 3 * 3 + 2  # univariate params + (a, b)
+    assert m.aic == pytest.approx(2 * k - 2 * m.loglik_)
+    assert m.bic == pytest.approx(k * np.log(400) - 2 * m.loglik_)
+    se = m.std_err
+    assert se.shape == (2,)
+    assert np.all((se > 0) | np.isnan(se))
+    s = m.summary()
+    assert "DCC" in s and "method" in s
+
+
+def test_dcc_loglik_consistent_across_methods():
+    # loglik_ always reports the full-likelihood value, so CL and full fits
+    # on the same data should report similar (not identical) values
+    returns = simulate_dcc_returns(800, 3, a=0.06, b=0.90, seed=15)
+    full = DCC(n_jobs=1, method="full").fit(returns)
+    cl = DCC(n_jobs=1, method="cl").fit(returns)
+    assert abs(full.loglik_ - cl.loglik_) / abs(full.loglik_) < 0.01
+
+
 def test_dcc_forecast_psd():
     returns = simulate_dcc_returns(400, 3, a=0.05, b=0.90, seed=13)
     m = DCC(n_jobs=1).fit(returns)

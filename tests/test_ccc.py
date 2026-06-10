@@ -66,3 +66,13 @@ def test_single_asset():
     m = CCC(n_jobs=1).fit(rng.standard_normal(200) * 0.01)
     assert m.H.shape == (200, 1, 1)
     assert np.all(np.isfinite(m.H))
+
+
+def test_ccc_diagnostics():
+    m = _fit_ccc(T=400)
+    assert np.isfinite(m.loglik_)
+    k = 4 * 3  # n assets x (omega, alpha, beta)
+    assert m.aic == pytest.approx(2 * k - 2 * m.loglik_)
+    assert m.bic == pytest.approx(k * np.log(400) - 2 * m.loglik_)
+    s = m.summary()
+    assert "CCC" in s and "loglik" in s

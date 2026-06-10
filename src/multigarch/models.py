@@ -304,6 +304,8 @@ class CCC:
         self.H: NDArray[np.float64] | None = None  # Covariances (final or path)
         self._n_assets: int = 0
         self._T: int = 0
+        self._std_resid: NDArray[np.float64] | None = None
+        self._loglik: float | None = None
 
     def fit(self, returns: NDArray[np.float64]) -> CCC:
         """Fit CCC-GARCH model.
@@ -335,6 +337,8 @@ class CCC:
         for i, garch in enumerate(self.garch_models):
             sigmas[:, i] = np.sqrt(garch.sigma2)
             std_resid[:, i] = garch.resid / sigmas[:, i]
+        self._std_resid = std_resid
+        self._loglik = None
 
         # Constant correlation from standardized residuals
         S = np.corrcoef(std_resid.T) if n > 1 else np.array([[1.0]])
@@ -349,6 +353,53 @@ class CCC:
             self.H = sigmas[:, :, None] * self.R[None, :, :] * sigmas[:, None, :]
 
         return self
+
+    @property
+    def _n_params(self) -> int:
+        """Optimizer-estimated parameters only; R is moment-estimated."""
+        return sum(g._n_params for g in self.garch_models)
+
+    @property
+    def loglik_(self) -> float:
+        """Two-step Gaussian quasi-log-likelihood (volatility + correlation parts)."""
+        _check_fitted(self.H is not None)
+        if self._loglik is None:
+            try:
+                L = np.linalg.cholesky(self.R)
+            except np.linalg.LinAlgError:
+                warnings.warn(
+                    "R is not positive definite; loglik_ is NaN (try shrinkage > 0)",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
+                self._loglik = float("nan")
+                return self._loglik
+            sol = np.linalg.solve(L, self._std_resid.T)
+            quad = float((sol**2).sum())
+            logdet = 2.0 * float(np.log(np.diag(L)).sum())
+            sum_ee = float((self._std_resid**2).sum())
+            corr_ll = -0.5 * (self._T * logdet + quad - sum_ee)
+            self._loglik = sum(g.loglik_ for g in self.garch_models) + corr_ll
+        return self._loglik
+
+    @property
+    def aic(self) -> float:
+        return 2.0 * self._n_params - 2.0 * self.loglik_
+
+    @property
+    def bic(self) -> float:
+        return self._n_params * np.log(self._T) - 2.0 * self.loglik_
+
+    def summary(self) -> str:
+        """Formatted model summary."""
+        _check_fitted(self.H is not None)
+        return "\n".join(
+            [
+                f"CCC({self.p}, {self.q})  T={self._T}  n={self._n_assets}",
+                f"  shrinkage: {self.shrinkage}",
+                f"  loglik: {self.loglik_:.2f}  AIC: {self.aic:.2f}  BIC: {self.bic:.2f}",
+            ]
+        )
 
     def forecast(self, horizon: int = 1) -> NDArray[np.float64]:
         """Forecast covariance matrices.
@@ -439,6 +490,9 @@ class DCC:
         self.Q_last: NDArray[np.float64] | None = None  # Final Q_t for forecasting
         self._n_assets: int = 0
         self._T: int = 0
+        self._std_resid: NDArray[np.float64] | None = None
+        self._loglik: float | None = None
+        self._std_err: NDArray[np.float64] | None = None
 
     def fit(self, returns: NDArray[np.float64]) -> DCC:
         """Fit DCC-GARCH model.
@@ -470,6 +524,9 @@ class DCC:
         for i, garch in enumerate(self.garch_models):
             sigmas[:, i] = np.sqrt(garch.sigma2)
             std_resid[:, i] = garch.resid / sigmas[:, i]
+        self._std_resid = std_resid
+        self._loglik = None
+        self._std_err = None
 
         # Step 2: Estimate DCC parameters
         S = np.corrcoef(std_resid.T) if n > 1 else np.array([[1.0]])
@@ -514,6 +571,69 @@ class DCC:
             )
 
         return self
+
+    @property
+    def _n_params(self) -> int:
+        """Optimizer-estimated parameters: univariate + (a, b). Q_bar is targeted."""
+        return sum(g._n_params for g in self.garch_models) + 2
+
+    @property
+    def loglik_(self) -> float:
+        """Two-step Gaussian quasi-log-likelihood (volatility + correlation parts).
+
+        Always evaluates the FULL correlation likelihood once at the fitted
+        (a, b), regardless of estimation method; the correlation part
+        conditions on the first observation. One O(T*n^3) pass — a few
+        seconds at n=500.
+        """
+        _check_fitted(self.H is not None)
+        if self._loglik is None:
+            corr_nll = dcc_loglik_loop(self._std_resid, self.Q_bar, self.a, self.b)
+            sum_ee = float((self._std_resid[1:] ** 2).sum())
+            corr_ll = -corr_nll + 0.5 * sum_ee
+            self._loglik = sum(g.loglik_ for g in self.garch_models) + corr_ll
+        return self._loglik
+
+    @property
+    def aic(self) -> float:
+        return 2.0 * self._n_params - 2.0 * self.loglik_
+
+    @property
+    def bic(self) -> float:
+        return self._n_params * np.log(self._T) - 2.0 * self.loglik_
+
+    @property
+    def std_err(self) -> NDArray[np.float64]:
+        """Approximate standard errors for (a, b).
+
+        Inverse numerical Hessian of the second-stage objective actually
+        used for estimation (full or composite). Both ignore first-stage
+        estimation error (no sandwich correction) — treat as indicative.
+        """
+        _check_fitted(self.H is not None)
+        if self._std_err is None:
+            loglik_fn = dcc_cl_loglik if self.method_ == "cl" else dcc_loglik_loop
+
+            def f(x: NDArray[np.float64]) -> float:
+                return loglik_fn(self._std_resid, self.Q_bar, x[0], x[1])
+
+            H = _numerical_hessian(f, np.array([self.a, self.b]))
+            self._std_err = _se_from_hessian(H)
+        return self._std_err
+
+    def summary(self) -> str:
+        """Formatted model summary."""
+        _check_fitted(self.H is not None)
+        return "\n".join(
+            [
+                f"DCC({self.p}, {self.q})  T={self._T}  n={self._n_assets}"
+                f"  method={self.method_}",
+                f"  a: {self.a:.4f}  b: {self.b:.4f}  a+b: {self.a + self.b:.4f}",
+                f"  shrinkage: {self.shrinkage}",
+                f"  loglik: {self.loglik_:.2f}  AIC: {self.aic:.2f}  BIC: {self.bic:.2f}",
+                f"  converged: {self.converged}",
+            ]
+        )
 
     def forecast(self, horizon: int = 1) -> NDArray[np.float64]:
         """Forecast covariance matrices.
