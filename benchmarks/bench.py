@@ -38,10 +38,10 @@ def main():
     print("|---|-----|----------|------------|")
     for n in sizes:
         r = simulate(T, n)
-        t_ccc = timeit(lambda: CCC(low_memory=True).fit(r))
-        t_cl = timeit(lambda: DCC(method="cl", low_memory=True).fit(r))
+        t_ccc = timeit(lambda r=r: CCC(low_memory=True).fit(r))
+        t_cl = timeit(lambda r=r: DCC(method="cl", low_memory=True).fit(r))
         if n <= full_max_n:
-            t_full = f"{timeit(lambda: DCC(method='full', low_memory=True).fit(r)):.2f}"
+            t_full = f"{timeit(lambda r=r: DCC(method='full', low_memory=True).fit(r)):.2f}"
         else:
             t_full = "—"
         print(f"| {n} | {t_ccc:.2f} | {t_cl:.2f} | {t_full} |")
