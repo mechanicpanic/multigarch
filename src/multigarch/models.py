@@ -16,6 +16,20 @@ from multigarch._jit import (
 )
 
 
+def _validate_returns(returns: NDArray[np.float64], min_obs: int) -> NDArray[np.float64]:
+    """Validate a returns array: finite values and enough observations."""
+    if not np.all(np.isfinite(returns)):
+        raise ValueError("returns must contain only finite values (no NaN/inf)")
+    if returns.shape[0] < min_obs:
+        raise ValueError(f"need at least {min_obs} observations, got {returns.shape[0]}")
+    return returns
+
+
+def _check_fitted(is_fitted: bool) -> None:
+    if not is_fitted:
+        raise ValueError("Model not fitted; call fit() first")
+
+
 def _fit_single_garch(returns: NDArray, p: int, q: int) -> GARCH:
     """Fit a single GARCH model (helper for parallel fitting)."""
     return GARCH(p=p, q=q).fit(returns)
@@ -59,6 +73,7 @@ class GARCH:
             self for chaining
         """
         returns = np.asarray(returns, dtype=np.float64).flatten()
+        _validate_returns(returns, min_obs=max(10, self.p + self.q + 2))
         T = len(returns)
         var0 = float(np.var(returns))
         p, q = self.p, self.q
@@ -96,8 +111,7 @@ class GARCH:
         Returns:
             Array of forecasted variances
         """
-        if self.sigma2 is None:
-            raise ValueError("Model not fitted")
+        _check_fitted(self.sigma2 is not None)
 
         p, q = self.p, self.q
 
@@ -164,6 +178,7 @@ class CCC:
         returns = np.asarray(returns, dtype=np.float64)
         if returns.ndim == 1:
             returns = returns.reshape(-1, 1)
+        _validate_returns(returns, min_obs=max(10, self.p + self.q + 2))
 
         T, n = returns.shape
         self._T = T
@@ -208,8 +223,7 @@ class CCC:
         Returns:
             Array of shape (horizon, n_assets, n_assets) of forecasted covariances
         """
-        if self.H is None:
-            raise ValueError("Model not fitted")
+        _check_fitted(self.H is not None)
 
         n = self._n_assets
         forecasts = np.zeros((horizon, n, n))
@@ -275,6 +289,7 @@ class DCC:
         returns = np.asarray(returns, dtype=np.float64)
         if returns.ndim == 1:
             returns = returns.reshape(-1, 1)
+        _validate_returns(returns, min_obs=max(10, self.p + self.q + 2))
 
         T, n = returns.shape
         self._T = T
@@ -327,8 +342,7 @@ class DCC:
         Returns:
             Array of shape (horizon, n_assets, n_assets) of forecasted covariances
         """
-        if self.H is None:
-            raise ValueError("Model not fitted")
+        _check_fitted(self.H is not None)
 
         if self.Q_bar is None or self.Q_last is None:
             raise ValueError("Missing DCC state for forecasting")
