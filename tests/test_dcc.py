@@ -67,6 +67,12 @@ def test_invalid_method_raises():
         DCC(method="exact")
 
 
+def test_dcc_shrinkage_applies_to_q_bar():
+    returns = simulate_dcc_returns(300, 3, a=0.05, b=0.90, seed=9)
+    m = DCC(n_jobs=1, shrinkage=1.0).fit(returns)
+    np.testing.assert_allclose(m.Q_bar, np.eye(3), atol=1e-12)
+
+
 def test_dcc_constraint_respected():
     rng = np.random.default_rng(8)
     returns = rng.standard_normal((400, 4)) * 0.01

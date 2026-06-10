@@ -275,6 +275,7 @@ class CCC:
         n_jobs: int = -1,
         low_memory: bool = False,
         mean: str = "zero",
+        shrinkage: float = 0.0,
     ) -> None:
         """Initialize CCC-GARCH model.
 
@@ -284,9 +285,15 @@ class CCC:
             n_jobs: Number of parallel jobs for GARCH fitting (-1 = all cores)
             low_memory: If True, only store final covariance matrix (not full path)
             mean: mean model for the univariate fits ("zero" or "constant")
+            shrinkage: shrink the correlation matrix toward identity,
+                R = (1-shrinkage)*S + shrinkage*I. Use > 0 when T is not
+                much larger than n; it guarantees a well-conditioned target
         """
         if mean not in ("zero", "constant"):
             raise ValueError(f"mean must be 'zero' or 'constant', got {mean!r}")
+        if not 0.0 <= shrinkage <= 1.0:
+            raise ValueError(f"shrinkage must be in [0, 1], got {shrinkage}")
+        self.shrinkage = shrinkage
         self.p = p
         self.q = q
         self.mean = mean
@@ -330,9 +337,8 @@ class CCC:
             std_resid[:, i] = garch.resid / sigmas[:, i]
 
         # Constant correlation from standardized residuals
-        self.R = np.corrcoef(std_resid.T)
-        if n == 1:
-            self.R = np.array([[1.0]])
+        S = np.corrcoef(std_resid.T) if n > 1 else np.array([[1.0]])
+        self.R = (1.0 - self.shrinkage) * S + self.shrinkage * np.eye(n)
 
         if self.low_memory:
             # Only store final covariance matrix
@@ -393,6 +399,7 @@ class DCC:
         low_memory: bool = False,
         mean: str = "zero",
         method: str = "auto",
+        shrinkage: float = 0.0,
     ) -> None:
         """Initialize DCC-GARCH model.
 
@@ -407,11 +414,17 @@ class DCC:
                 (O(T·n), recommended for large n: dramatically faster and
                 less biased), or "auto" (default) which picks "cl" when
                 n > 25
+            shrinkage: shrink the correlation target toward identity,
+                Q_bar = (1-shrinkage)*S + shrinkage*I. Use > 0 when T is not
+                much larger than n; it guarantees a well-conditioned target
         """
         if mean not in ("zero", "constant"):
             raise ValueError(f"mean must be 'zero' or 'constant', got {mean!r}")
         if method not in ("auto", "full", "cl"):
             raise ValueError(f"method must be 'auto', 'full' or 'cl', got {method!r}")
+        if not 0.0 <= shrinkage <= 1.0:
+            raise ValueError(f"shrinkage must be in [0, 1], got {shrinkage}")
+        self.shrinkage = shrinkage
         self.method = method
         self.method_: str | None = None
         self.converged: bool = False
@@ -462,9 +475,8 @@ class DCC:
             std_resid[:, i] = garch.resid / sigmas[:, i]
 
         # Step 2: Estimate DCC parameters
-        self.Q_bar = np.corrcoef(std_resid.T).astype(np.float64)
-        if n == 1:
-            self.Q_bar = np.array([[1.0]], dtype=np.float64)
+        S = np.corrcoef(std_resid.T) if n > 1 else np.array([[1.0]])
+        self.Q_bar = (1.0 - self.shrinkage) * S + self.shrinkage * np.eye(n)
 
         method = self.method
         if method == "auto":
