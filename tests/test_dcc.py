@@ -79,3 +79,38 @@ def test_dcc_constraint_respected():
     m = DCC(n_jobs=1).fit(returns)
     assert m.a >= 0 and m.b >= 0
     assert m.a + m.b <= 0.999 + 1e-8
+
+
+def test_dcc_low_memory_matches_final_step():
+    returns = simulate_dcc_returns(400, 3, a=0.05, b=0.90, seed=10)
+    full = DCC(n_jobs=1, low_memory=False).fit(returns)
+    lm = DCC(n_jobs=1, low_memory=True).fit(returns)
+    np.testing.assert_allclose(lm.H, full.H[-1], rtol=1e-8)
+    np.testing.assert_allclose(lm.R, full.R[-1], rtol=1e-8)
+    np.testing.assert_allclose(lm.Q_last, full.Q_last, rtol=1e-8)
+
+
+def test_dcc_invariants():
+    returns = simulate_dcc_returns(400, 4, a=0.05, b=0.90, seed=11)
+    m = DCC(n_jobs=1).fit(returns)
+    for t in [0, 200, 399]:
+        np.testing.assert_allclose(np.diag(m.R[t]), 1.0, atol=1e-10)
+        np.testing.assert_allclose(m.H[t], m.H[t].T, atol=1e-14)
+        assert np.abs(m.R[t]).max() <= 1.0 + 1e-10
+        assert np.linalg.eigvalsh(m.H[t]).min() > -1e-12
+
+
+def test_dcc_single_asset():
+    rng = np.random.default_rng(12)
+    m = DCC(n_jobs=1).fit(rng.standard_normal(200) * 0.01)
+    assert m.H.shape == (200, 1, 1)
+    assert np.all(np.isfinite(m.H))
+
+
+def test_dcc_forecast_psd():
+    returns = simulate_dcc_returns(400, 3, a=0.05, b=0.90, seed=13)
+    m = DCC(n_jobs=1).fit(returns)
+    f = m.forecast(10)
+    assert f.shape == (10, 3, 3)
+    for h in range(10):
+        assert np.linalg.eigvalsh(f[h]).min() > 0

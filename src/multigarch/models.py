@@ -342,14 +342,11 @@ class CCC:
 
         if self.low_memory:
             # Only store final covariance matrix
-            D = np.diag(sigmas[-1])
-            self.H = D @ self.R @ D  # shape: (n, n)
+            s_last = sigmas[-1]
+            self.H = self.R * np.outer(s_last, s_last)  # shape: (n, n)
         else:
-            # Store full covariance path
-            self.H = np.zeros((T, n, n))
-            for t in range(T):
-                D = np.diag(sigmas[t])
-                self.H[t] = D @ self.R @ D
+            # Store full covariance path: H[t] = diag(s_t) @ R @ diag(s_t)
+            self.H = sigmas[:, :, None] * self.R[None, :, :] * sigmas[:, None, :]
 
         return self
 
@@ -374,8 +371,8 @@ class CCC:
 
         # Correlation is constant
         for h in range(horizon):
-            D = np.diag(np.sqrt(var_forecasts[h]))
-            forecasts[h] = D @ self.R @ D
+            s = np.sqrt(var_forecasts[h])
+            forecasts[h] = self.R * np.outer(s, s)
 
         return forecasts
 
@@ -547,11 +544,10 @@ class DCC:
             Q_forecast = one_minus_b * self.Q_bar + self.b * Q_forecast
 
             # Normalize to correlation
-            Q_diag = np.diag(Q_forecast)
-            inv_sqrt = np.diag(1.0 / np.sqrt(Q_diag))
-            R_forecast = inv_sqrt @ Q_forecast @ inv_sqrt
+            d = 1.0 / np.sqrt(np.diag(Q_forecast))
+            R_forecast = Q_forecast * np.outer(d, d)
 
-            D = np.diag(np.sqrt(var_forecasts[h]))
-            forecasts[h] = D @ R_forecast @ D
+            s = np.sqrt(var_forecasts[h])
+            forecasts[h] = R_forecast * np.outer(s, s)
 
         return forecasts
