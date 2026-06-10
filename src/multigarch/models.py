@@ -10,6 +10,7 @@ from numpy.typing import NDArray
 from scipy.optimize import minimize
 
 from multigarch._jit import (
+    dcc_cl_loglik,
     dcc_covariance_loop,
     dcc_final_covariance,
     dcc_loglik_loop,
@@ -391,6 +392,7 @@ class DCC:
         n_jobs: int = -1,
         low_memory: bool = False,
         mean: str = "zero",
+        method: str = "auto",
     ) -> None:
         """Initialize DCC-GARCH model.
 
@@ -400,9 +402,19 @@ class DCC:
             n_jobs: Number of parallel jobs for GARCH fitting (-1 = all cores)
             low_memory: If True, only store final covariance/correlation matrices
             mean: mean model for the univariate fits ("zero" or "constant")
+            method: second-stage estimator — "full" exact likelihood
+                (O(T·n³) per evaluation), "cl" pairwise composite likelihood
+                (O(T·n), recommended for large n: dramatically faster and
+                less biased), or "auto" (default) which picks "cl" when
+                n > 25
         """
         if mean not in ("zero", "constant"):
             raise ValueError(f"mean must be 'zero' or 'constant', got {mean!r}")
+        if method not in ("auto", "full", "cl"):
+            raise ValueError(f"method must be 'auto', 'full' or 'cl', got {method!r}")
+        self.method = method
+        self.method_: str | None = None
+        self.converged: bool = False
         self.p = p
         self.q = q
         self.mean = mean
@@ -454,14 +466,33 @@ class DCC:
         if n == 1:
             self.Q_bar = np.array([[1.0]], dtype=np.float64)
 
-        def neg_log_likelihood(params: NDArray[np.float64]) -> float:
-            return dcc_loglik_loop(std_resid, self.Q_bar, params[0], params[1])
+        method = self.method
+        if method == "auto":
+            method = "cl" if n > 25 else "full"
+        self.method_ = method
+        loglik_fn = dcc_cl_loglik if method == "cl" else dcc_loglik_loop
+
+        def objective(params: NDArray[np.float64]) -> float:
+            return loglik_fn(std_resid, self.Q_bar, params[0], params[1])
 
         x0 = np.array([0.05, 0.90])
-        bounds = [(1e-6, 0.499), (1e-6, 0.998)]
+        bounds = [(1e-8, 0.999), (1e-8, 0.999)]
+        constraints = [{"type": "ineq", "fun": lambda x: 0.999 - x[0] - x[1]}]
 
-        result = minimize(neg_log_likelihood, x0, method="L-BFGS-B", bounds=bounds)
-        self.a, self.b = result.x
+        result = minimize(
+            objective,
+            x0,
+            method="SLSQP",
+            bounds=bounds,
+            constraints=constraints,
+            options={"maxiter": 200},
+        )
+        if not result.success:
+            warnings.warn(
+                f"DCC optimizer did not converge: {result.message}", RuntimeWarning, stacklevel=2
+            )
+        self.converged = bool(result.success)
+        self.a, self.b = float(result.x[0]), float(result.x[1])
 
         # Compute covariance matrices
         if self.low_memory:
