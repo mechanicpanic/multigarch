@@ -1,7 +1,7 @@
 """JIT-compiled inner loops for GARCH models."""
 
 import numpy as np
-from numba import njit
+from numba import njit, prange
 
 
 @njit(cache=True, nogil=True)
@@ -156,6 +156,69 @@ def dcc_loglik_loop(
         ll += logdet + quad
 
     return 0.5 * ll
+
+
+@njit(cache=True, nogil=True, parallel=True)
+def dcc_cl_loglik(
+    std_resid: np.ndarray,
+    Q_bar: np.ndarray,
+    a: float,
+    b: float,
+) -> float:
+    """Pairwise composite negative log-likelihood over contiguous pairs.
+
+    Sums closed-form bivariate Gaussian NLLs (0.5*(log(1-rho^2)+quad), t>=1)
+    over pairs (i, i+1). O(T*n) per evaluation, no linear algebra. The
+    correlation is clamped to +/-(1 - 1e-8) so the value is finite
+    everywhere.
+
+    Args:
+        std_resid: Standardized residuals (T, n)
+        Q_bar: Unconditional correlation matrix (n, n)
+        a: DCC a parameter
+        b: DCC b parameter
+
+    Returns:
+        Composite negative log-likelihood
+    """
+    T, n = std_resid.shape
+    one_minus_ab = 1.0 - a - b
+    rho_max = 1.0 - 1e-8
+
+    total = 0.0
+    for k in prange(n - 1):
+        i = k
+        j = k + 1
+        qbar_ij = Q_bar[i, j]
+        # Q_bar has a unit diagonal, so the diagonal recursions use
+        # one_minus_ab directly
+        qii = 1.0
+        qjj = 1.0
+        qij = qbar_ij
+        ll = 0.0
+        for t in range(1, T):
+            ei = std_resid[t - 1, i]
+            ej = std_resid[t - 1, j]
+            qii = one_minus_ab + a * ei * ei + b * qii
+            qjj = one_minus_ab + a * ej * ej + b * qjj
+            qij = one_minus_ab * qbar_ij + a * ei * ej + b * qij
+
+            denom = qii * qjj
+            if denom < 1e-24:
+                denom = 1e-24
+            rho = qij / np.sqrt(denom)
+            if rho > rho_max:
+                rho = rho_max
+            elif rho < -rho_max:
+                rho = -rho_max
+
+            one_m_r2 = 1.0 - rho * rho
+            xi = std_resid[t, i]
+            xj = std_resid[t, j]
+            ll += np.log(one_m_r2) + (xi * xi + xj * xj - 2.0 * rho * xi * xj) / one_m_r2
+        total += ll
+
+    return 0.5 * total
 
 
 @njit(cache=True, nogil=True)
