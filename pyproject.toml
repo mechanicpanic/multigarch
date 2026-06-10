@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "multigarch"
-version = "0.1.0"
+version = "0.2.0"
 description = "Simple Multivariate GARCH models (DCC, CCC) for Python"
 readme = "README.md"
 license = "MIT"
@@ -29,7 +29,17 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=7.0"]
+dev = ["pytest>=7.0", "ruff>=0.4"]
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/multigarch"]
+
+[tool.ruff]
+line-length = 100
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

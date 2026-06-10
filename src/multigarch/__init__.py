@@ -3,4 +3,4 @@
 from multigarch.models import CCC, DCC, GARCH
 
 __all__ = ["GARCH", "CCC", "DCC"]
-__version__ = "0.1.0"
+__version__ = "0.2.0"
