@@ -14,6 +14,10 @@ def garch_variance_loop(
 ) -> np.ndarray:
     """Compute GARCH(p,q) conditional variance series.
 
+    Each step is clamped to [1e-10, 1e12] so the recursion (and any
+    likelihood built on it) stays finite even at infeasible parameters
+    probed by the optimizer during line search.
+
     Args:
         returns: 1D array of returns
         omega: intercept
@@ -32,17 +36,18 @@ def garch_variance_loop(
     sigma2 = np.full(T, var0)
 
     for t in range(max_lag, T):
-        arch_term = 0.0
+        s = omega
         for i in range(p):
-            arch_term += alpha[i] * returns[t - 1 - i] ** 2
-
-        garch_term = 0.0
+            s += alpha[i] * returns[t - 1 - i] ** 2
         for j in range(q):
-            garch_term += beta[j] * sigma2[t - 1 - j]
+            s += beta[j] * sigma2[t - 1 - j]
+        if s < 1e-10:
+            s = 1e-10
+        elif s > 1e12:
+            s = 1e12
+        sigma2[t] = s
 
-        sigma2[t] = omega + arch_term + garch_term
-
-    return np.maximum(sigma2, 1e-10)
+    return sigma2
 
 
 @njit(cache=True)
@@ -53,7 +58,10 @@ def garch_loglik(
     beta: np.ndarray,
     var0: float,
 ) -> float:
-    """Compute GARCH(p,q) log-likelihood.
+    """GARCH(p,q) negative log-likelihood: 0.5 * sum(log s2 + r^2/s2).
+
+    Finite and smooth everywhere; positivity/stationarity are enforced by
+    the optimizer's bounds and constraints, not by penalty cliffs.
 
     Args:
         returns: 1D array of returns
@@ -65,25 +73,8 @@ def garch_loglik(
     Returns:
         Negative log-likelihood (for minimization)
     """
-    if omega <= 0:
-        return 1e10
-
-    for i in range(len(alpha)):
-        if alpha[i] < 0:
-            return 1e10
-
-    for j in range(len(beta)):
-        if beta[j] < 0:
-            return 1e10
-
-    persistence = 0.0
-    for i in range(len(alpha)):
-        persistence += alpha[i]
-    for j in range(len(beta)):
-        persistence += beta[j]
-
-    if persistence >= 1.0:
-        return 1e10
+    if omega < 1e-12:
+        omega = 1e-12
 
     sigma2 = garch_variance_loop(returns, omega, alpha, beta, var0)
 

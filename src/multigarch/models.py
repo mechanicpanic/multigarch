@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import warnings
+
 import numpy as np
 from joblib import Parallel, delayed
 from numpy.typing import NDArray
@@ -62,6 +64,11 @@ class GARCH:
         self.beta: NDArray[np.float64] | None = None
         self.resid: NDArray[np.float64] | None = None
         self.sigma2: NDArray[np.float64] | None = None
+        self.converged: bool = False
+        self._nll: float | None = None
+        self._var0: float | None = None
+        self._x_opt: NDArray[np.float64] | None = None
+        self._T: int = 0
 
     def fit(self, returns: NDArray[np.float64]) -> GARCH:
         """Fit GARCH(p,q) to return series.
@@ -78,24 +85,38 @@ class GARCH:
         var0 = float(np.var(returns))
         p, q = self.p, self.q
 
-        def neg_log_likelihood(params: NDArray[np.float64]) -> float:
-            omega = params[0]
-            alpha = params[1 : 1 + p]
-            beta = params[1 + p : 1 + p + q]
-            return garch_loglik(returns, omega, alpha, beta, var0)
+        def objective(params: NDArray[np.float64]) -> float:
+            return garch_loglik(returns, params[0], params[1 : 1 + p], params[1 + p :], var0)
 
         # Initial values
         alpha0 = np.full(p, 0.05 / p)
         beta0 = np.full(q, 0.90 / q)
         x0 = np.concatenate([[var0 * 0.05], alpha0, beta0])
 
-        bounds = [(1e-10, None)] + [(1e-10, 0.999)] * (p + q)
+        bounds = [(1e-12, None)] + [(0.0, 0.999)] * (p + q)
+        constraints = [{"type": "ineq", "fun": lambda x: 0.999 - np.sum(x[1:])}]
 
-        result = minimize(neg_log_likelihood, x0, method="L-BFGS-B", bounds=bounds)
+        result = minimize(
+            objective,
+            x0,
+            method="SLSQP",
+            bounds=bounds,
+            constraints=constraints,
+            options={"maxiter": 500},
+        )
+        if not result.success:
+            warnings.warn(
+                f"GARCH optimizer did not converge: {result.message}", RuntimeWarning, stacklevel=2
+            )
+        self.converged = bool(result.success)
 
-        self.omega = result.x[0]
-        self.alpha = result.x[1 : 1 + p]
-        self.beta = result.x[1 + p : 1 + p + q]
+        self.omega = float(result.x[0])
+        self.alpha = result.x[1 : 1 + p].copy()
+        self.beta = result.x[1 + p :].copy()
+        self._nll = float(result.fun)
+        self._var0 = var0
+        self._x_opt = result.x.copy()
+        self._T = T
 
         self.resid = returns.copy()
         self.sigma2 = garch_variance_loop(returns, self.omega, self.alpha, self.beta, var0)
