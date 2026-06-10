@@ -107,6 +107,19 @@ def test_dcc_single_asset():
     assert np.all(np.isfinite(m.H))
 
 
+def test_cl_no_silent_stall_at_large_n():
+    # Regression: with the raw summed CL objective (|f| ~ 3e5 here), SLSQP
+    # returned x0=(0.05, 0.90) unchanged after 3 function evaluations while
+    # reporting success. The data below has constant correlation and no
+    # dynamics, so a genuine fit must move `a` well off the 0.05 start.
+    rng = np.random.default_rng(21)
+    common = rng.standard_normal((4000, 1))
+    idio = rng.standard_normal((4000, 500))
+    returns = (np.sqrt(0.6) * common + np.sqrt(0.4) * idio) * 0.01
+    m = DCC(method="cl", low_memory=True).fit(returns)
+    assert m.a < 0.04
+
+
 def test_dcc_diagnostics():
     returns = simulate_dcc_returns(400, 3, a=0.05, b=0.90, seed=14)
     m = DCC(n_jobs=1).fit(returns)

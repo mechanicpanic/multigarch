@@ -134,8 +134,11 @@ class GARCH:
         var0 = float(np.var(returns))
         p, q = self.p, self.q
 
+        # SLSQP degenerates silently (returns x0, reports success) when the
+        # objective magnitude is large, so optimize the per-observation
+        # average; a constant rescale leaves the optimum unchanged.
         def objective(params: NDArray[np.float64]) -> float:
-            return garch_loglik(returns, params[0], params[1 : 1 + p], params[1 + p :], var0)
+            return garch_loglik(returns, params[0], params[1 : 1 + p], params[1 + p :], var0) / T
 
         # Initial values
         alpha0 = np.full(p, 0.05 / p)
@@ -162,7 +165,7 @@ class GARCH:
         self.omega = float(result.x[0])
         self.alpha = result.x[1 : 1 + p].copy()
         self.beta = result.x[1 + p :].copy()
-        self._nll = float(result.fun)
+        self._nll = float(result.fun) * T
         self._var0 = var0
         self._x_opt = result.x.copy()
         self._T = T
@@ -538,8 +541,14 @@ class DCC:
         self.method_ = method
         loglik_fn = dcc_cl_loglik if method == "cl" else dcc_loglik_loop
 
+        # SLSQP degenerates silently (returns x0, reports success) when the
+        # objective magnitude is large — observed at n=500, T=1258 with the
+        # raw summed CL objective. Optimize the per-pair, per-step average;
+        # a constant rescale leaves the optimum unchanged.
+        denom = max(float((T - 1) * (n - 1 if method == "cl" else 1)), 1.0)
+
         def objective(params: NDArray[np.float64]) -> float:
-            return loglik_fn(std_resid, self.Q_bar, params[0], params[1])
+            return loglik_fn(std_resid, self.Q_bar, params[0], params[1]) / denom
 
         x0 = np.array([0.05, 0.90])
         bounds = [(1e-8, 0.999), (1e-8, 0.999)]
