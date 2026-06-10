@@ -316,7 +316,7 @@ class CCC:
         self._n_assets = n
 
         # Fit univariate GARCH models in parallel
-        self.garch_models = Parallel(n_jobs=self.n_jobs)(
+        self.garch_models = Parallel(n_jobs=self.n_jobs, prefer="threads")(
             delayed(_fit_single_garch)(returns[:, i], self.p, self.q, self.mean)
             for i in range(n)
         )
@@ -437,7 +437,7 @@ class DCC:
         self._n_assets = n
 
         # Step 1: Fit univariate GARCH models in parallel
-        self.garch_models = Parallel(n_jobs=self.n_jobs)(
+        self.garch_models = Parallel(n_jobs=self.n_jobs, prefer="threads")(
             delayed(_fit_single_garch)(returns[:, i], self.p, self.q, self.mean)
             for i in range(n)
         )

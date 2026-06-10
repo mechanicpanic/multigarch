@@ -4,7 +4,7 @@ import numpy as np
 from numba import njit
 
 
-@njit(cache=True)
+@njit(cache=True, nogil=True)
 def garch_variance_loop(
     returns: np.ndarray,
     omega: float,
@@ -50,7 +50,7 @@ def garch_variance_loop(
     return sigma2
 
 
-@njit(cache=True)
+@njit(cache=True, nogil=True)
 def garch_loglik(
     returns: np.ndarray,
     omega: float,
@@ -85,14 +85,18 @@ def garch_loglik(
     return 0.5 * ll
 
 
-@njit(cache=True)
+@njit(cache=True, nogil=True)
 def dcc_loglik_loop(
     std_resid: np.ndarray,
     Q_bar: np.ndarray,
     a: float,
     b: float,
 ) -> float:
-    """Compute DCC log-likelihood.
+    """DCC negative log-likelihood: 0.5 * sum_{t>=1}(log|R_t| + e' R_t^-1 e).
+
+    Allocation-free inner loop. The Cholesky pivot floor keeps the value
+    finite (and large, via the exploding quadratic form) for near-singular
+    R instead of raising.
 
     Args:
         std_resid: Standardized residuals (T, n)
@@ -103,62 +107,58 @@ def dcc_loglik_loop(
     Returns:
         Negative log-likelihood
     """
-    if a < 0 or b < 0 or a + b >= 1:
-        return 1e10
-
     T, n = std_resid.shape
-    Q = Q_bar.copy()
-    ll = 0.0
     one_minus_ab = 1.0 - a - b
 
+    Q = Q_bar.copy()
+    L = np.zeros((n, n))
+    y = np.zeros(n)
+    d = np.zeros(n)
+
+    ll = 0.0
     for t in range(1, T):
-        # Update Q
-        eps = std_resid[t - 1, :].reshape(-1, 1)
-        Q = one_minus_ab * Q_bar + a * (eps @ eps.T) + b * Q
-
-        # Normalize to correlation matrix R
-        Q_diag = np.diag(Q).copy()
         for i in range(n):
-            if Q_diag[i] <= 0:
-                return 1e10
-            Q_diag[i] = 1.0 / np.sqrt(Q_diag[i])
-
-        R = np.zeros((n, n))
-        for i in range(n):
+            ei = std_resid[t - 1, i]
             for j in range(n):
-                R[i, j] = Q[i, j] * Q_diag[i] * Q_diag[j]
+                Q[i, j] = one_minus_ab * Q_bar[i, j] + a * ei * std_resid[t - 1, j] + b * Q[i, j]
 
-        # Log-likelihood: -0.5 * (log|R| + eps' R^{-1} eps)
-        # Use Cholesky for numerical stability
-        try:
-            L = np.linalg.cholesky(R)
-        except:
-            return 1e10
+        for i in range(n):
+            qi = Q[i, i]
+            if qi < 1e-12:
+                qi = 1e-12
+            d[i] = 1.0 / np.sqrt(qi)
+
+        # Cholesky of R = D Q D, built element-wise from Q without forming R
+        for i in range(n):
+            for j in range(i + 1):
+                s = Q[i, j] * d[i] * d[j]
+                for k in range(j):
+                    s -= L[i, k] * L[j, k]
+                if i == j:
+                    if s < 1e-10:
+                        s = 1e-10
+                    L[i, i] = np.sqrt(s)
+                else:
+                    L[i, j] = s / L[j, j]
 
         logdet = 0.0
         for i in range(n):
             logdet += 2.0 * np.log(L[i, i])
 
-        eps_t = std_resid[t, :].copy()
-
-        # Solve L @ y = eps_t
-        y = np.zeros(n)
+        quad = 0.0
         for i in range(n):
-            s = eps_t[i]
-            for j in range(i):
-                s -= L[i, j] * y[j]
+            s = std_resid[t, i]
+            for k in range(i):
+                s -= L[i, k] * y[k]
             y[i] = s / L[i, i]
+            quad += y[i] * y[i]
 
-        quad_form = 0.0
-        for i in range(n):
-            quad_form += y[i] ** 2
-
-        ll += logdet + quad_form
+        ll += logdet + quad
 
     return 0.5 * ll
 
 
-@njit(cache=True)
+@njit(cache=True, nogil=True)
 def dcc_covariance_loop(
     std_resid: np.ndarray,
     sigmas: np.ndarray,
@@ -176,44 +176,43 @@ def dcc_covariance_loop(
         b: DCC b parameter
 
     Returns:
-        Tuple of (R, H) arrays of shape (T, n, n)
+        (R, H, Q_last): R and H of shape (T, n, n), Q_last of shape (n, n)
     """
     T, n = std_resid.shape
     R = np.zeros((T, n, n))
     H = np.zeros((T, n, n))
+    d = np.zeros(n)
 
     Q = Q_bar.copy()
-    R[0] = Q_bar.copy()
-
-    # First covariance matrix
-    for i in range(n):
-        for j in range(n):
-            H[0, i, j] = sigmas[0, i] * R[0, i, j] * sigmas[0, j]
-
     one_minus_ab = 1.0 - a - b
 
+    for i in range(n):
+        for j in range(n):
+            R[0, i, j] = Q_bar[i, j]
+            H[0, i, j] = sigmas[0, i] * Q_bar[i, j] * sigmas[0, j]
+
     for t in range(1, T):
-        eps = std_resid[t - 1, :].reshape(-1, 1)
-        Q = one_minus_ab * Q_bar + a * (eps @ eps.T) + b * Q
-
-        # Normalize to correlation
-        Q_diag_inv_sqrt = np.zeros(n)
         for i in range(n):
-            Q_diag_inv_sqrt[i] = 1.0 / np.sqrt(Q[i, i])
+            ei = std_resid[t - 1, i]
+            for j in range(n):
+                Q[i, j] = one_minus_ab * Q_bar[i, j] + a * ei * std_resid[t - 1, j] + b * Q[i, j]
+
+        for i in range(n):
+            qi = Q[i, i]
+            if qi < 1e-12:
+                qi = 1e-12
+            d[i] = 1.0 / np.sqrt(qi)
 
         for i in range(n):
             for j in range(n):
-                R[t, i, j] = Q[i, j] * Q_diag_inv_sqrt[i] * Q_diag_inv_sqrt[j]
-
-        # Covariance
-        for i in range(n):
-            for j in range(n):
-                H[t, i, j] = sigmas[t, i] * R[t, i, j] * sigmas[t, j]
+                r = Q[i, j] * d[i] * d[j]
+                R[t, i, j] = r
+                H[t, i, j] = sigmas[t, i] * r * sigmas[t, j]
 
     return R, H, Q
 
 
-@njit(cache=True)
+@njit(cache=True, nogil=True)
 def dcc_final_covariance(
     std_resid: np.ndarray,
     sigmas: np.ndarray,
@@ -233,7 +232,7 @@ def dcc_final_covariance(
         b: DCC b parameter
 
     Returns:
-        Tuple of (R_final, H_final) arrays of shape (n, n)
+        (R_final, H_final, Q_last), each of shape (n, n)
     """
     T, n = std_resid.shape
 
@@ -241,23 +240,23 @@ def dcc_final_covariance(
     one_minus_ab = 1.0 - a - b
 
     for t in range(1, T):
-        eps = std_resid[t - 1, :].reshape(-1, 1)
-        Q = one_minus_ab * Q_bar + a * (eps @ eps.T) + b * Q
+        for i in range(n):
+            ei = std_resid[t - 1, i]
+            for j in range(n):
+                Q[i, j] = one_minus_ab * Q_bar[i, j] + a * ei * std_resid[t - 1, j] + b * Q[i, j]
 
-    # Final correlation matrix
     R_final = np.zeros((n, n))
-    Q_diag_inv_sqrt = np.zeros(n)
-    for i in range(n):
-        Q_diag_inv_sqrt[i] = 1.0 / np.sqrt(Q[i, i])
-
-    for i in range(n):
-        for j in range(n):
-            R_final[i, j] = Q[i, j] * Q_diag_inv_sqrt[i] * Q_diag_inv_sqrt[j]
-
-    # Final covariance matrix
     H_final = np.zeros((n, n))
+    d = np.zeros(n)
+    for i in range(n):
+        qi = Q[i, i]
+        if qi < 1e-12:
+            qi = 1e-12
+        d[i] = 1.0 / np.sqrt(qi)
     for i in range(n):
         for j in range(n):
-            H_final[i, j] = sigmas[-1, i] * R_final[i, j] * sigmas[-1, j]
+            r = Q[i, j] * d[i] * d[j]
+            R_final[i, j] = r
+            H_final[i, j] = sigmas[T - 1, i] * r * sigmas[T - 1, j]
 
     return R_final, H_final, Q
