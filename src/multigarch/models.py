@@ -77,14 +77,17 @@ def _fit_single_garch(returns: NDArray, p: int, q: int, mean: str) -> GARCH:
 
 
 class GARCH:
-    """Univariate GARCH(p,q) model with JIT-accelerated fitting.
+    r"""Univariate GARCH(p,q) model with JIT-accelerated fitting.
 
-    Model: σ²_t = ω + Σᵢ αᵢ * ε²_{t-i} + Σⱼ βⱼ * σ²_{t-j}
+    Model:
+
+    $$\sigma^2_t = \omega + \sum_{i=1}^{p} \alpha_i \varepsilon^2_{t-i}
+                 + \sum_{j=1}^{q} \beta_j \sigma^2_{t-j}$$
 
     Parameters after fitting:
-        omega: long-run variance weight
-        alpha: ARCH coefficients (array of length p)
-        beta: GARCH coefficients (array of length q)
+        omega: long-run variance weight $\omega$
+        alpha: ARCH coefficients $\alpha_1, \dots, \alpha_p$
+        beta: GARCH coefficients $\beta_1, \dots, \beta_q$
     """
 
     def __init__(self, p: int = 1, q: int = 1, mean: str = "zero") -> None:
@@ -261,14 +264,15 @@ class GARCH:
 
 
 class CCC:
-    """Constant Conditional Correlation GARCH model.
+    r"""Constant Conditional Correlation GARCH model.
 
     Assumes correlation is constant over time, only variances are dynamic.
     Much faster than DCC for many assets.
 
-    H_t = D_t * R * D_t
+    $$H_t = D_t \, R \, D_t$$
 
-    where D_t = diag(σ_{1,t}, ..., σ_{n,t}) and R is constant.
+    where $D_t = \mathrm{diag}(\sigma_{1,t}, \dots, \sigma_{n,t})$ and the
+    correlation matrix $R$ is constant.
     """
 
     def __init__(
@@ -432,14 +436,22 @@ class CCC:
 
 
 class DCC:
-    """Dynamic Conditional Correlation GARCH model with JIT acceleration.
+    r"""Dynamic Conditional Correlation GARCH model with JIT acceleration.
 
     Two-step estimation:
         1. Fit univariate GARCH(p,q) to each series (parallel)
         2. Estimate DCC parameters for correlation dynamics (JIT-accelerated)
 
-    DCC model: Q_t = (1-a-b)*Q̄ + a*ε_{t-1}*ε'_{t-1} + b*Q_{t-1}
-               R_t = diag(Q_t)^{-1/2} * Q_t * diag(Q_t)^{-1/2}
+    DCC model:
+
+    $$Q_t = (1 - a - b)\,\bar{Q} + a\,\varepsilon_{t-1}\varepsilon_{t-1}'
+          + b\,Q_{t-1}$$
+    $$R_t = \mathrm{diag}(Q_t)^{-1/2} \, Q_t \, \mathrm{diag}(Q_t)^{-1/2}$$
+
+    For large cross-sections the second stage can use a pairwise composite
+    likelihood over contiguous pairs $(i, i+1)$ — set `method="cl"` (chosen
+    automatically for $n > 25$): $O(Tn)$ per optimizer evaluation instead of
+    $O(Tn^3)$, and less biased at large $n$.
     """
 
     def __init__(

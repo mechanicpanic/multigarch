@@ -26,7 +26,7 @@ jobs:
         with:
           python-version: "3.12"
       - run: uv sync
-      - run: uv run --with pdoc pdoc multigarch -o _site
+      - run: uv run --with pdoc pdoc multigarch --math -t docs/pdoc -o _site
       - uses: actions/upload-pages-artifact@v3
       - uses: actions/deploy-pages@v4
         id: deployment
