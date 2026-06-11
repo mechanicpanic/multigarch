@@ -28,11 +28,20 @@ dependencies = [
     "joblib>=1.3",
 ]
 
+[project.urls]
+Homepage = "https://github.com/mechanicpanic/multigarch"
+Repository = "https://github.com/mechanicpanic/multigarch"
+Issues = "https://github.com/mechanicpanic/multigarch/issues"
+Changelog = "https://github.com/mechanicpanic/multigarch/releases"
+
 [project.optional-dependencies]
 dev = ["pytest>=7.0", "ruff>=0.4"]
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/multigarch"]
+
+[tool.hatch.build.targets.sdist]
+only-include = ["src/multigarch", "tests", "benchmarks", "README.md", "LICENSE"]
 
 [tool.ruff]
 line-length = 100
