@@ -57,7 +57,9 @@ dcc = DCC(p=2, q=1, n_jobs=4).fit(returns)
 
 - `p`, `q`: ARCH / GARCH orders (default 1)
 - `mean`: `"zero"` (default) or `"constant"` (demean, stores `mu`)
-- `n_jobs`: parallel jobs for univariate fits, -1 = all cores (CCC/DCC)
+- `n_jobs`: threads for the univariate fits, -1 = all cores (CCC/DCC).
+  Only effective on a free-threaded Python (`3.13t`/`3.14t`); with the GIL
+  enabled the fits run serially, since threads would only contend
 - `low_memory`: store only the final covariance/correlation instead of the
   full (T, n, n) paths. Storing both R and H paths costs `2·T·n²·8` bytes —
   about 8 GB at T=2000, n=500 — so use `low_memory=True` at large n.

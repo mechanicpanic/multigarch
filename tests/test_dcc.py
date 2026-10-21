@@ -150,3 +150,16 @@ def test_dcc_forecast_psd():
     assert f.shape == (10, 3, 3)
     for h in range(10):
         assert np.linalg.eigvalsh(f[h]).min() > 0
+
+
+@pytest.mark.parametrize("n_jobs", [2, -1])
+def test_parallel_fit_matches_serial(n_jobs):
+    # Threads are only used on a free-threaded build; results must not
+    # depend on n_jobs or on column-to-worker blocking either way.
+    returns = np.random.default_rng(31).standard_normal((300, 7)) * 0.01
+    serial = DCC(n_jobs=1).fit(returns)
+    par = DCC(n_jobs=n_jobs).fit(returns)
+    for g_s, g_p in zip(serial.garch_models, par.garch_models):
+        assert g_p.omega == g_s.omega
+        np.testing.assert_array_equal(g_p.sigma2, g_s.sigma2)
+    assert (par.a, par.b) == (serial.a, serial.b)

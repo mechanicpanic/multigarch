@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
+import sys
 import warnings
 
 import numpy as np
-from joblib import Parallel, delayed
+from joblib import Parallel, delayed, effective_n_jobs
 from numpy.typing import NDArray
 from scipy.optimize import minimize
 
@@ -72,9 +73,34 @@ def _se_from_hessian(H: NDArray[np.float64]) -> NDArray[np.float64]:
     return np.sqrt(diag)
 
 
-def _fit_single_garch(returns: NDArray, p: int, q: int, mean: str) -> GARCH:
-    """Fit a single GARCH model (helper for parallel fitting)."""
-    return GARCH(p=p, q=q, mean=mean).fit(returns)
+def _fit_garch_block(
+    returns: NDArray[np.float64], cols: NDArray[np.intp], p: int, q: int, mean: str
+) -> list[GARCH]:
+    """Fit GARCH models to a block of columns (one parallel task)."""
+    return [GARCH(p=p, q=q, mean=mean).fit(returns[:, i]) for i in cols]
+
+
+def _fit_garch_columns(
+    returns: NDArray[np.float64], p: int, q: int, mean: str, n_jobs: int
+) -> list[GARCH]:
+    """Fit a univariate GARCH to every column of a (T, n) array.
+
+    Threads only help on a free-threaded (no-GIL) interpreter: the SLSQP
+    driver loop holds the GIL, so with it enabled threads just contend and
+    the fit runs serially. Columns go out in one contiguous block per
+    worker — a single fit takes ~0.5 ms, so per-column tasks would be
+    dominated by dispatch overhead.
+    """
+    n = returns.shape[1]
+    gil_enabled = getattr(sys, "_is_gil_enabled", lambda: True)()
+    n_workers = 1 if gil_enabled else min(effective_n_jobs(n_jobs), n)
+    if n_workers <= 1:
+        return _fit_garch_block(returns, np.arange(n), p, q, mean)
+    blocks = Parallel(n_jobs=n_workers, prefer="threads")(
+        delayed(_fit_garch_block)(returns, cols, p, q, mean)
+        for cols in np.array_split(np.arange(n), n_workers)
+    )
+    return [m for block in blocks for m in block]
 
 
 class GARCH:
@@ -317,7 +343,8 @@ class CCC:
         Args:
             p: ARCH order for univariate GARCH models
             q: GARCH order for univariate GARCH models
-            n_jobs: Number of parallel jobs for GARCH fitting (-1 = all cores)
+            n_jobs: Number of threads for GARCH fitting (-1 = all cores); only
+                used on a free-threaded (no-GIL) Python, serial otherwise
             low_memory: If True, only store final covariance matrix (not full path)
             mean: mean model for the univariate fits ("zero" or "constant")
             shrinkage: shrink the correlation matrix toward identity,
@@ -361,10 +388,7 @@ class CCC:
         self._n_assets = n
 
         # Fit univariate GARCH models in parallel
-        self.garch_models = Parallel(n_jobs=self.n_jobs, prefer="threads")(
-            delayed(_fit_single_garch)(returns[:, i], self.p, self.q, self.mean)
-            for i in range(n)
-        )
+        self.garch_models = _fit_garch_columns(returns, self.p, self.q, self.mean, self.n_jobs)
 
         # Compute standardized residuals
         std_resid = np.zeros((T, n))
@@ -497,7 +521,8 @@ class DCC:
         Args:
             p: ARCH order for univariate GARCH models
             q: GARCH order for univariate GARCH models
-            n_jobs: Number of parallel jobs for GARCH fitting (-1 = all cores)
+            n_jobs: Number of threads for GARCH fitting (-1 = all cores); only
+                used on a free-threaded (no-GIL) Python, serial otherwise
             low_memory: If True, only store final covariance/correlation matrices
             mean: mean model for the univariate fits ("zero" or "constant")
             method: second-stage estimator — "full" exact likelihood
@@ -556,10 +581,7 @@ class DCC:
         self._n_assets = n
 
         # Step 1: Fit univariate GARCH models in parallel
-        self.garch_models = Parallel(n_jobs=self.n_jobs, prefer="threads")(
-            delayed(_fit_single_garch)(returns[:, i], self.p, self.q, self.mean)
-            for i in range(n)
-        )
+        self.garch_models = _fit_garch_columns(returns, self.p, self.q, self.mean, self.n_jobs)
 
         # Compute standardized residuals
         std_resid = np.zeros((T, n), dtype=np.float64)
