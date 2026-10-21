@@ -86,6 +86,79 @@ def garch_loglik(
 
 
 @njit(cache=True, nogil=True)
+def garch_loglik_grad(
+    returns: np.ndarray,
+    params: np.ndarray,
+    p: int,
+    q: int,
+    var0: float,
+) -> tuple[float, np.ndarray]:
+    """GARCH(p,q) negative log-likelihood and its analytic gradient.
+
+    Same value as ``garch_loglik``. The gradient propagates
+    d sigma2_t / d theta through the recursion
+    ``ds_t = (1, r^2_{t-i}, sigma2_{t-j}) + sum_j beta_j ds_{t-j}``;
+    steps hitting the variance clamp contribute a zero derivative,
+    matching the clamped (locally constant) value.
+
+    Args:
+        returns: 1D array of returns
+        params: (omega, alpha_1..alpha_p, beta_1..beta_q)
+        p: ARCH order
+        q: GARCH order
+        var0: initial variance estimate
+
+    Returns:
+        (nll, grad) with grad of shape (1 + p + q,)
+    """
+    T = len(returns)
+    k = 1 + p + q
+    max_lag = max(p, q)
+    omega = params[0]
+    if omega < 1e-12:
+        omega = 1e-12
+
+    sigma2 = np.empty(T)
+    ds = np.zeros((T, k))
+    grad = np.zeros(k)
+
+    ll = 0.0
+    for t in range(min(max_lag, T)):
+        sigma2[t] = var0
+        ll += np.log(var0) + returns[t] ** 2 / var0
+
+    for t in range(max_lag, T):
+        s = omega
+        for i in range(p):
+            s += params[1 + i] * returns[t - 1 - i] ** 2
+        for j in range(q):
+            s += params[1 + p + j] * sigma2[t - 1 - j]
+
+        r2 = returns[t] ** 2
+        if s < 1e-10:
+            s = 1e-10
+        elif s > 1e12:
+            s = 1e12
+        else:
+            ds[t, 0] = 1.0
+            for i in range(p):
+                ds[t, 1 + i] = returns[t - 1 - i] ** 2
+            for j in range(q):
+                ds[t, 1 + p + j] = sigma2[t - 1 - j]
+            for j in range(q):
+                bj = params[1 + p + j]
+                for c in range(k):
+                    ds[t, c] += bj * ds[t - 1 - j, c]
+            w = 0.5 * (1.0 - r2 / s) / s
+            for c in range(k):
+                grad[c] += w * ds[t, c]
+        sigma2[t] = s
+        ll += np.log(s) + r2 / s
+
+    return 0.5 * ll, grad
+
+
+@njit(cache=True, nogil=True)
 def dcc_loglik_loop(
     std_resid: np.ndarray,
     Q_bar: np.ndarray,

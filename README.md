@@ -80,17 +80,17 @@ T=2000, `low_memory=True`, times in seconds:
 
 | n | CCC | DCC (cl) | DCC (full) |
 |---|-----|----------|------------|
-| 10 | 0.10 | 0.09 | 0.11 |
-| 50 | 0.42 | 0.43 | 0.80 |
-| 100 | 0.85 | 0.87 | — |
-| 300 | 2.57 | 2.69 | — |
+| 10 | 0.02 | 0.02 | 0.02 |
+| 50 | 0.04 | 0.04 | 0.30 |
+| 100 | 0.05 | 0.06 | — |
+| 300 | 0.15 | 0.20 | — |
 
 The full likelihood is O(T·n³) per optimizer evaluation and is skipped above
 n=50; the composite likelihood scales linearly in n.
 
 On real data (CRSP daily returns, 500 most liquid common shares with
 complete 2019–2023 history, T=1258 — see `benchmarks/bench_crsp.py`):
-`DCC(method="cl")` fits n=500 in ~2 s with a=0.025, b=0.931.
+`DCC(method="cl")` fits n=500 in ~0.4 s with a=0.025, b=0.930.
 
 ## License
 

@@ -90,3 +90,22 @@ def test_summary():
     s = m.summary()
     assert "GARCH(1, 1)" in s
     assert "loglik" in s
+
+
+def test_fit_is_scale_invariant():
+    # Daily-return scale (omega ~ 1e-6) used to stall SLSQP far from the
+    # optimum; fitting at unit scale and at 1e-2 scale must agree.
+    r = simulate_garch(2000, omega=0.05, alpha=0.08, beta=0.90, seed=21)
+    big = GARCH().fit(r)
+    small = GARCH().fit(r * 0.01)
+    np.testing.assert_allclose(small.alpha, big.alpha, rtol=1e-4, atol=1e-6)
+    np.testing.assert_allclose(small.beta, big.beta, rtol=1e-4, atol=1e-6)
+    assert small.omega == pytest.approx(big.omega * 1e-4, rel=1e-3)
+    assert small.loglik_ == pytest.approx(big.loglik_ - 2000 * np.log(0.01), abs=1e-6)
+    np.testing.assert_allclose(small.sigma2, big.sigma2 * 1e-4, rtol=1e-3)
+    assert small.std_err[0] == pytest.approx(big.std_err[0] * 1e-4, rel=1e-2)
+
+
+def test_zero_variance_raises():
+    with pytest.raises(ValueError, match="zero variance"):
+        GARCH().fit(np.zeros(100))

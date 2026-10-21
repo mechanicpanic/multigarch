@@ -3,7 +3,7 @@
 import numpy as np
 import pytest
 
-from multigarch._jit import dcc_cl_loglik, dcc_loglik_loop
+from multigarch._jit import dcc_cl_loglik, dcc_loglik_loop, garch_loglik, garch_loglik_grad
 
 
 def _numpy_dcc_nll(std_resid, Q_bar, a, b):
@@ -66,3 +66,22 @@ def test_cl_loglik_single_asset_is_zero():
     rng = np.random.default_rng(4)
     e = rng.standard_normal((50, 1))
     assert dcc_cl_loglik(e, np.array([[1.0]]), 0.05, 0.90) == 0.0
+
+
+@pytest.mark.parametrize("pq", [(1, 1), (2, 1), (1, 2), (2, 2)])
+def test_garch_grad_matches_value_and_finite_differences(pq):
+    p, q = pq
+    rng = np.random.default_rng(5)
+    r = rng.standard_normal(300)
+    var0 = float(np.var(r))
+    x = np.concatenate([[0.08], np.full(p, 0.06 / p), np.full(q, 0.85 / q)])
+
+    def f(z):
+        return garch_loglik(r, z[0], z[1 : 1 + p], z[1 + p :], var0)
+
+    val, grad = garch_loglik_grad(r, x, p, q, var0)
+    assert val == pytest.approx(f(x), rel=1e-12)
+
+    h = 1e-6
+    fd = np.array([(f(x + h * e) - f(x - h * e)) / (2 * h) for e in np.eye(len(x))])
+    np.testing.assert_allclose(grad, fd, rtol=1e-5, atol=1e-6)

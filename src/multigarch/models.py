@@ -15,6 +15,7 @@ from multigarch._jit import (
     dcc_final_covariance,
     dcc_loglik_loop,
     garch_loglik,
+    garch_loglik_grad,
     garch_variance_loop,
 )
 
@@ -115,6 +116,8 @@ class GARCH:
         self.sigma2: NDArray[np.float64] | None = None
         self.converged: bool = False
         self._nll: float | None = None
+        self._z: NDArray[np.float64] | None = None
+        self._scale: float = 1.0
         self._var0: float | None = None
         self._x_opt: NDArray[np.float64] | None = None
         self._T: int = 0
@@ -134,14 +137,22 @@ class GARCH:
         self.mu = float(returns.mean()) if self.mean == "constant" else 0.0
         returns = returns - self.mu
         T = len(returns)
-        var0 = float(np.var(returns))
+        scale = float(np.std(returns))
+        if scale == 0.0:
+            raise ValueError("returns have zero variance")
         p, q = self.p, self.q
 
-        # SLSQP degenerates silently (returns x0, reports success) when the
-        # objective magnitude is large, so optimize the per-observation
-        # average; a constant rescale leaves the optimum unchanged.
-        def objective(params: NDArray[np.float64]) -> float:
-            return garch_loglik(returns, params[0], params[1 : 1 + p], params[1 + p :], var0) / T
+        # Optimize on unit-variance returns: with raw daily returns omega is
+        # ~1e-6 next to alpha, beta ~0.1, and SLSQP stalls far from the
+        # optimum while reporting success. omega scales by scale**2, alpha
+        # and beta are scale-free. SLSQP also degenerates silently when the
+        # objective magnitude is large, so use the per-observation average.
+        z = returns / scale
+        var0 = float(np.var(z))
+
+        def objective(params: NDArray[np.float64]) -> tuple[float, NDArray[np.float64]]:
+            nll, grad = garch_loglik_grad(z, params, p, q, var0)
+            return nll / T, grad / T
 
         # Initial values
         alpha0 = np.full(p, 0.05 / p)
@@ -149,11 +160,19 @@ class GARCH:
         x0 = np.concatenate([[var0 * 0.05], alpha0, beta0])
 
         bounds = [(1e-12, None)] + [(0.0, 0.999)] * (p + q)
-        constraints = [{"type": "ineq", "fun": lambda x: 0.999 - np.sum(x[1:])}]
+        jac_persistence = np.concatenate([[0.0], -np.ones(p + q)])
+        constraints = [
+            {
+                "type": "ineq",
+                "fun": lambda x: 0.999 - np.sum(x[1:]),
+                "jac": lambda x: jac_persistence,
+            }
+        ]
 
         result = minimize(
             objective,
             x0,
+            jac=True,
             method="SLSQP",
             bounds=bounds,
             constraints=constraints,
@@ -165,21 +184,26 @@ class GARCH:
             )
         self.converged = bool(result.success)
 
-        self.omega = float(result.x[0])
+        scale2 = scale * scale
+        self.omega = float(result.x[0]) * scale2
         self.alpha = result.x[1 : 1 + p].copy()
         self.beta = result.x[1 + p :].copy()
-        self._nll = float(result.fun) * T
+        # nll(returns) = nll(z) + T * log(scale)
+        self._nll = float(result.fun) * T + T * np.log(scale)
+        self._z = z
+        self._scale = scale
         self._var0 = var0
         self._x_opt = result.x.copy()
         self._T = T
 
         self.resid = returns.copy()
-        self.sigma2 = garch_variance_loop(returns, self.omega, self.alpha, self.beta, var0)
+        self.sigma2 = scale2 * garch_variance_loop(z, result.x[0], self.alpha, self.beta, var0)
 
         return self
 
     def _objective(self, x: NDArray[np.float64]) -> float:
-        return garch_loglik(self.resid, x[0], x[1 : 1 + self.p], x[1 + self.p :], self._var0)
+        """Negative log-likelihood in the unit-variance parametrization."""
+        return garch_loglik(self._z, x[0], x[1 : 1 + self.p], x[1 + self.p :], self._var0)
 
     @property
     def _n_params(self) -> int:
@@ -209,8 +233,12 @@ class GARCH:
         """
         _check_fitted(self.sigma2 is not None)
         if self._std_err is None:
+            # Hessian in the unit-variance parametrization, where all
+            # parameters are O(1); omega = scale**2 * omega_z
             H = _numerical_hessian(self._objective, self._x_opt)
-            self._std_err = _se_from_hessian(H)
+            se = _se_from_hessian(H)
+            se[0] *= self._scale**2
+            self._std_err = se
         return self._std_err
 
     def summary(self) -> str:
