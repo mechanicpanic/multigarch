@@ -86,6 +86,71 @@ def garch_loglik(
 
 
 @njit(cache=True, nogil=True)
+def _garch_nll_grad_into(
+    returns: np.ndarray,
+    params: np.ndarray,
+    p: int,
+    q: int,
+    var0: float,
+    sigma2: np.ndarray,
+    ds: np.ndarray,
+    grad: np.ndarray,
+) -> float:
+    """Allocation-free core of ``garch_loglik_grad``.
+
+    Writes the gradient into ``grad`` (length 1 + p + q) using the work
+    buffers ``sigma2`` (length T) and ``ds`` (T, 1 + p + q); returns the
+    negative log-likelihood.
+    """
+    T = len(returns)
+    k = 1 + p + q
+    max_lag = max(p, q)
+    omega = params[0]
+    if omega < 1e-12:
+        omega = 1e-12
+
+    for c in range(k):
+        grad[c] = 0.0
+
+    ll = 0.0
+    for t in range(min(max_lag, T)):
+        sigma2[t] = var0
+        for c in range(k):
+            ds[t, c] = 0.0
+        ll += np.log(var0) + returns[t] ** 2 / var0
+
+    for t in range(max_lag, T):
+        s = omega
+        for i in range(p):
+            s += params[1 + i] * returns[t - 1 - i] ** 2
+        for j in range(q):
+            s += params[1 + p + j] * sigma2[t - 1 - j]
+
+        r2 = returns[t] ** 2
+        if s < 1e-10 or s > 1e12:
+            s = 1e-10 if s < 1e-10 else 1e12
+            for c in range(k):
+                ds[t, c] = 0.0
+        else:
+            ds[t, 0] = 1.0
+            for i in range(p):
+                ds[t, 1 + i] = returns[t - 1 - i] ** 2
+            for j in range(q):
+                ds[t, 1 + p + j] = sigma2[t - 1 - j]
+            for j in range(q):
+                bj = params[1 + p + j]
+                for c in range(k):
+                    ds[t, c] += bj * ds[t - 1 - j, c]
+            w = 0.5 * (1.0 - r2 / s) / s
+            for c in range(k):
+                grad[c] += w * ds[t, c]
+        sigma2[t] = s
+        ll += np.log(s) + r2 / s
+
+    return 0.5 * ll
+
+
+@njit(cache=True, nogil=True)
 def garch_loglik_grad(
     returns: np.ndarray,
     params: np.ndarray,
@@ -113,49 +178,312 @@ def garch_loglik_grad(
     """
     T = len(returns)
     k = 1 + p + q
-    max_lag = max(p, q)
-    omega = params[0]
-    if omega < 1e-12:
-        omega = 1e-12
+    grad = np.empty(k)
+    nll = _garch_nll_grad_into(returns, params, p, q, var0, np.empty(T), np.empty((T, k)), grad)
+    return nll, grad
 
+
+# Feasible set for the unit-variance parameters x = (omega, alpha, beta):
+# omega >= _OMEGA_MIN, alpha, beta >= 0, sum(alpha) + sum(beta) <= _MAX_PERSISTENCE
+_OMEGA_MIN = 1e-12
+_MAX_PERSISTENCE = 0.999
+
+
+@njit(cache=True, nogil=True)
+def garch_project(x: np.ndarray, out: np.ndarray) -> None:
+    """Euclidean projection of ``x`` onto the GARCH feasible set.
+
+    omega is clipped at its lower bound; the coefficient block is
+    clipped at zero and, if its sum still exceeds the persistence cap,
+    projected onto the capped simplex ``{y >= 0, sum(y) = cap}``.
+    """
+    k1 = len(x)
+    out[0] = x[0] if x[0] > _OMEGA_MIN else _OMEGA_MIN
+    tot = 0.0
+    for c in range(1, k1):
+        v = x[c] if x[c] > 0.0 else 0.0
+        out[c] = v
+        tot += v
+    if tot <= _MAX_PERSISTENCE:
+        return
+    # Simplex projection (Held et al.): find tau with sum(max(x - tau, 0)) = cap
+    v = np.sort(x[1:])[::-1]
+    css = 0.0
+    tau = 0.0
+    for m in range(k1 - 1):
+        css += v[m]
+        t = (css - _MAX_PERSISTENCE) / (m + 1)
+        if m == k1 - 2 or v[m + 1] <= t:
+            tau = t
+            break
+    for c in range(1, k1):
+        d = x[c] - tau
+        out[c] = d if d > 0.0 else 0.0
+
+
+@njit(cache=True, nogil=True)
+def _projected_gradient_norm(x: np.ndarray, g: np.ndarray, work: np.ndarray) -> float:
+    """max |x - P(x - g)|: zero exactly at a constrained stationary point."""
+    k1 = len(x)
+    for c in range(k1):
+        work[c] = x[c] - g[c]
+    garch_project(work.copy(), work)
+    m = 0.0
+    for c in range(k1):
+        d = abs(x[c] - work[c])
+        if d > m:
+            m = d
+    return m
+
+
+@njit(cache=True, nogil=True)
+def garch_fit_projected(
+    returns: np.ndarray,
+    x0: np.ndarray,
+    p: int,
+    q: int,
+    var0: float,
+    maxiter: int,
+    gtol: float,
+    ftol: float,
+) -> tuple[np.ndarray, float, bool]:
+    """Minimize the per-observation GARCH NLL over the feasible set.
+
+    Projected BFGS (Kim, Sra & Dhillon 2010): the quasi-Newton direction
+    is restricted to free variables — those not held at a bound by the
+    gradient — and the step searches along the projection arc
+    ``P(x + t d)`` with an Armijo test. Boundary optima (alpha_i = 0,
+    persistence at the cap) are reached exactly. The inverse-Hessian
+    estimate is reset whenever the free set changes: the free block of
+    the full inverse is a poor inverse of the reduced Hessian when
+    omega and beta are strongly correlated, and steps zigzag. Converged
+    when the projected-gradient norm drops below ``gtol``, or when a
+    step improves the objective by less than ``ftol * (1 + |f|)`` (as
+    in L-BFGS-B; flat ridges, e.g. beta when alpha = 0).
+
+    Returns:
+        (x, nll_per_obs, converged) with x = (omega, alpha, beta)
+    """
+    T = len(returns)
+    k1 = 1 + p + q
+    inv_T = 1.0 / T
     sigma2 = np.empty(T)
-    ds = np.zeros((T, k))
-    grad = np.zeros(k)
+    ds = np.empty((T, k1))
 
-    ll = 0.0
-    for t in range(min(max_lag, T)):
-        sigma2[t] = var0
-        ll += np.log(var0) + returns[t] ** 2 / var0
+    x = np.empty(k1)
+    garch_project(x0, x)
+    g = np.empty(k1)
+    x_new = np.empty(k1)
+    trial = np.empty(k1)
+    g_new = np.empty(k1)
+    d = np.empty(k1)
+    y = np.empty(k1)
+    s = np.empty(k1)
+    Hy = np.empty(k1)
+    work = np.empty(k1)
+    free = np.ones(k1, dtype=np.bool_)
+    H = np.eye(k1)
+    gamma = 1.0  # last curvature scale sy / yy, for resets
+    just_reset = False
 
-    for t in range(max_lag, T):
-        s = omega
-        for i in range(p):
-            s += params[1 + i] * returns[t - 1 - i] ** 2
-        for j in range(q):
-            s += params[1 + p + j] * sigma2[t - 1 - j]
+    f = _garch_nll_grad_into(returns, x, p, q, var0, sigma2, ds, g) * inv_T
+    for c in range(k1):
+        g[c] *= inv_T
 
-        r2 = returns[t] ** 2
-        if s < 1e-10:
-            s = 1e-10
-        elif s > 1e12:
-            s = 1e12
-        else:
-            ds[t, 0] = 1.0
-            for i in range(p):
-                ds[t, 1 + i] = returns[t - 1 - i] ** 2
-            for j in range(q):
-                ds[t, 1 + p + j] = sigma2[t - 1 - j]
-            for j in range(q):
-                bj = params[1 + p + j]
-                for c in range(k):
-                    ds[t, c] += bj * ds[t - 1 - j, c]
-            w = 0.5 * (1.0 - r2 / s) / s
-            for c in range(k):
-                grad[c] += w * ds[t, c]
-        sigma2[t] = s
-        ll += np.log(s) + r2 / s
+    converged = False
+    scaled = False
+    for _ in range(maxiter):
+        if _projected_gradient_norm(x, g, work) < gtol:
+            converged = True
+            break
 
-    return 0.5 * ll, grad
+        # Variables held at a bound by the gradient are fixed this step
+        changed = False
+        for c in range(k1):
+            lower = _OMEGA_MIN if c == 0 else 0.0
+            fc = not (x[c] <= lower + 1e-14 and g[c] > 0.0)
+            if fc != free[c]:
+                changed = True
+            free[c] = fc
+        if changed:
+            for c in range(k1):
+                for e in range(k1):
+                    H[c, e] = gamma if c == e else 0.0
+
+        for c in range(k1):
+            acc = 0.0
+            if free[c]:
+                for e in range(k1):
+                    if free[e]:
+                        acc -= H[c, e] * g[e]
+            d[c] = acc
+
+        # Persistence at the cap: keep the step on the face sum(d_coef) = 0
+        # (null-space projection in the H metric) when it would push out
+        coef_sum = 0.0
+        ad = 0.0
+        for c in range(1, k1):
+            coef_sum += x[c]
+            if free[c]:
+                ad += d[c]
+        if coef_sum >= _MAX_PERSISTENCE - 1e-12 and ad > 0.0:
+            aHa = 0.0
+            for c in range(1, k1):
+                acc = 0.0
+                if free[c]:
+                    for e in range(1, k1):
+                        if free[e]:
+                            acc += H[c, e]
+                work[c] = acc  # (H a)_c on free coefficients
+                aHa += acc if free[c] else 0.0
+            if aHa > 0.0:
+                for c in range(1, k1):
+                    if free[c]:
+                        d[c] -= work[c] * ad / aHa
+            # omega's coupling through H: include it in the same projection
+            acc = 0.0
+            if free[0]:
+                for e in range(1, k1):
+                    if free[e]:
+                        acc += H[0, e]
+                if aHa > 0.0:
+                    d[0] -= acc * ad / aHa
+
+        # Search along the projection arc; fall back to steepest descent
+        ok = False
+        for attempt in range(2):
+            step = 1.0
+            for _ls in range(40):
+                for c in range(k1):
+                    trial[c] = x[c] + step * d[c]
+                garch_project(trial, x_new)
+                decrease = 0.0
+                for c in range(k1):
+                    decrease += g[c] * (x_new[c] - x[c])
+                if decrease < 0.0:
+                    f_new = (
+                        _garch_nll_grad_into(returns, x_new, p, q, var0, sigma2, ds, g_new) * inv_T
+                    )
+                    if f_new <= f + 1e-4 * decrease:
+                        ok = True
+                        break
+                step *= 0.5
+            if ok or attempt == 1:
+                break
+            for c in range(k1):
+                d[c] = -g[c]
+                for e in range(k1):
+                    H[c, e] = 1.0 if c == e else 0.0
+            scaled = False
+        if not ok:
+            converged = _projected_gradient_norm(x, g, work) < 10.0 * gtol
+            break
+
+        # Curvature pairs on the free coordinates only
+        sy = 0.0
+        yy = 0.0
+        for c in range(k1):
+            g_new[c] *= inv_T
+            s[c] = x_new[c] - x[c]
+            y[c] = g_new[c] - g[c] if free[c] else 0.0
+            sy += s[c] * y[c]
+            yy += y[c] * y[c]
+        df = f - f_new
+        for c in range(k1):
+            x[c] = x_new[c]
+            g[c] = g_new[c]
+        f = f_new
+        if df <= ftol * (1.0 + abs(f)):
+            pg = _projected_gradient_norm(x, g, work)
+            if pg < 1e3 * gtol:
+                converged = True
+                break
+            if just_reset:  # stalled even from a fresh H: give up
+                break
+            for c in range(k1):
+                for e in range(k1):
+                    H[c, e] = gamma if c == e else 0.0
+            just_reset = True
+            continue
+        just_reset = False
+
+        if sy > 1e-12 * yy and sy > 0.0:
+            gamma = sy / yy
+            if not scaled:  # Nocedal-Wright initial scaling of H
+                for c in range(k1):
+                    for e in range(k1):
+                        H[c, e] = gamma if c == e else 0.0
+                scaled = True
+            yHy = 0.0
+            for c in range(k1):
+                acc = 0.0
+                for e in range(k1):
+                    acc += H[c, e] * y[e]
+                Hy[c] = acc
+                yHy += y[c] * acc
+            rho = 1.0 / sy
+            for c in range(k1):
+                for e in range(k1):
+                    H[c, e] += (1.0 + yHy * rho) * rho * s[c] * s[e] - rho * (
+                        Hy[c] * s[e] + s[c] * Hy[e]
+                    )
+
+    return x, f, converged
+
+
+@njit(cache=True, nogil=True)
+def _on_boundary(x: np.ndarray) -> bool:
+    """True if a coefficient is at (or within 1e-3 of) 0, or persistence is at the cap."""
+    tot = 0.0
+    for c in range(1, len(x)):
+        if x[c] < 1e-3:
+            return True
+        tot += x[c]
+    return tot >= _MAX_PERSISTENCE - 1e-12
+
+
+@njit(cache=True, nogil=True, parallel=True)
+def garch_fit_batch(
+    Z: np.ndarray,
+    X0: np.ndarray,
+    p: int,
+    q: int,
+    var0: np.ndarray,
+    maxiter: int,
+    gtol: float,
+    ftol: float,
+    n_always: int,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Fit GARCH(p,q) to each row of ``Z`` (n, T) in parallel.
+
+    Runs ``garch_fit_projected`` from the first ``n_always`` starts in
+    ``X0`` (n_starts, 1+p+q), and from the rest only while the best fit
+    so far sits on or near the boundary (a coefficient below 1e-3 or
+    persistence at the cap) — the signature of a flat ridge the start led into. Keeps
+    the lowest objective. Rows are independent, so results do not
+    depend on the thread count.
+
+    Returns:
+        (params (n, 1+p+q), nll_per_obs (n,), converged (n,) as uint8)
+    """
+    n = Z.shape[0]
+    k1 = 1 + p + q
+    out = np.empty((n, k1))
+    nll = np.empty(n)
+    conv = np.zeros(n, dtype=np.uint8)
+    for i in prange(n):
+        best = np.inf
+        for st in range(X0.shape[0]):
+            if st >= n_always and not _on_boundary(out[i]):
+                break
+            x, f, ok = garch_fit_projected(Z[i], X0[st], p, q, var0[i], maxiter, gtol, ftol)
+            if f < best:
+                best = f
+                for c in range(k1):
+                    out[i, c] = x[c]
+                conv[i] = 1 if ok else 0
+        nll[i] = best
+    return out, nll, conv
 
 
 @njit(cache=True, nogil=True)

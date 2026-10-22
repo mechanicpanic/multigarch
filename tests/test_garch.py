@@ -109,3 +109,42 @@ def test_fit_is_scale_invariant():
 def test_zero_variance_raises():
     with pytest.raises(ValueError, match="zero variance"):
         GARCH().fit(np.zeros(100))
+
+
+@pytest.mark.parametrize("pq", [(1, 1), (2, 1), (1, 2), (2, 2)])
+def test_numba_fit_not_worse_than_slsqp(pq):
+    from multigarch.models import _garch_slsqp, _garch_starts
+
+    p, q = pq
+    r = simulate_garch(1500, omega=1e-6, alpha=0.07, beta=0.90, seed=40 + p + 2 * q)
+    m = GARCH(p, q).fit(r)
+    assert m.converged
+    x0 = _garch_starts(p, q)[0][0]
+    ref = _garch_slsqp(m._z, m._var0, p, q, x0)
+    assert m._nll <= ref.fun * len(r) + len(r) * np.log(m._scale) + 1e-3
+    assert m.alpha.sum() + m.beta.sum() < 0.999
+    assert np.all(m.sigma2 > 0)
+
+
+def test_slsqp_fallback_when_numba_fit_does_not_converge(monkeypatch):
+    import multigarch.models as models
+
+    monkeypatch.setattr(models, "_FIT_MAXITER", 1)
+    r = simulate_garch(1000, omega=0.05, alpha=0.08, beta=0.88, seed=41)
+    m = GARCH().fit(r)
+    monkeypatch.undo()
+    ref = GARCH().fit(r)
+    assert m.converged
+    assert m._nll == pytest.approx(ref._nll, abs=1e-3)
+
+
+@pytest.mark.parametrize(("n_jobs", "expected"), [(1, 1), (2, 2), (-1, None), (10_000, None)])
+def test_resolve_n_jobs(n_jobs, expected):
+    import numba
+
+    from multigarch.models import _resolve_n_jobs
+
+    max_threads = numba.config.NUMBA_NUM_THREADS
+    assert _resolve_n_jobs(n_jobs) == (expected or max_threads) if max_threads >= 2 else 1
+    with pytest.raises(ValueError):
+        _resolve_n_jobs(0)

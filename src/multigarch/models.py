@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
-import sys
 import warnings
+from collections.abc import Iterator
+from contextlib import contextmanager
 
+import numba
 import numpy as np
-from joblib import Parallel, delayed, effective_n_jobs
 from numpy.typing import NDArray
 from scipy.optimize import minimize
 
@@ -15,6 +16,7 @@ from multigarch._jit import (
     dcc_covariance_loop,
     dcc_final_covariance,
     dcc_loglik_loop,
+    garch_fit_batch,
     garch_loglik,
     garch_loglik_grad,
     garch_variance_loop,
@@ -73,34 +75,129 @@ def _se_from_hessian(H: NDArray[np.float64]) -> NDArray[np.float64]:
     return np.sqrt(diag)
 
 
-def _fit_garch_block(
-    returns: NDArray[np.float64], cols: NDArray[np.intp], p: int, q: int, mean: str
+def _resolve_n_jobs(n_jobs: int) -> int:
+    """Map an ``n_jobs`` value (-1 = all cores) to a numba thread count."""
+    if n_jobs == 0:
+        raise ValueError("n_jobs must be nonzero")
+    max_threads = numba.config.NUMBA_NUM_THREADS
+    k = n_jobs if n_jobs > 0 else max_threads + 1 + n_jobs
+    return max(1, min(k, max_threads))
+
+
+@contextmanager
+def _numba_threads(n_jobs: int) -> Iterator[None]:
+    """Run numba parallel kernels on ``n_jobs`` threads, then restore."""
+    prev = numba.get_num_threads()
+    numba.set_num_threads(_resolve_n_jobs(n_jobs))
+    try:
+        yield
+    finally:
+        numba.set_num_threads(prev)
+
+
+# Projected-BFGS settings for the numba GARCH fit (objective is the
+# per-observation NLL; gtol bounds the projected-gradient norm, ftol the
+# relative per-step improvement)
+_FIT_MAXITER = 500
+_FIT_GTOL = 1e-7
+_FIT_FTOL = 1e-10
+
+
+def _garch_starts(p: int, q: int) -> tuple[NDArray[np.float64], int]:
+    """Starting points (omega, alpha, beta) in unit-variance space, one per row.
+
+    Returns (starts, n_always). Higher-order likelihoods are often
+    multimodal, so all their starts always run. GARCH(1,1) runs its
+    second, low-persistence start only if the first fit ends on the
+    boundary: on near-white-noise series the default start leads onto
+    the flat omega-beta ridge.
+    """
+
+    def x(alpha, beta, omega=0.05):
+        return np.concatenate([[omega], alpha, beta])
+
+    starts = [x(np.full(p, 0.05 / p), np.full(q, 0.90 / q))]
+    if p + q == 2:
+        starts.append(x(np.array([0.10]), np.array([0.70]), omega=0.20))
+        return np.array(starts), 1
+    e = 1e-3
+    starts += [
+        x(np.r_[0.05, np.full(p - 1, e)], np.r_[0.90, np.full(q - 1, e)]),
+        x(np.r_[np.full(p - 1, e), 0.05], np.r_[np.full(q - 1, e), 0.90]),
+        x(np.full(p, 0.15 / p), np.full(q, 0.60 / q), omega=0.25),
+        x(np.full(p, 0.30 / p), np.full(q, 0.40 / q), omega=0.30),
+    ]
+    return np.array(starts), len(starts)
+
+
+def _garch_slsqp(z: NDArray[np.float64], var0: float, p: int, q: int, x0: NDArray[np.float64]):
+    """Constrained SLSQP fit in the unit-variance parametrization (fallback)."""
+    T = len(z)
+
+    def objective(params: NDArray[np.float64]) -> tuple[float, NDArray[np.float64]]:
+        nll, grad = garch_loglik_grad(z, params, p, q, var0)
+        return nll / T, grad / T
+
+    jac_persistence = np.concatenate([[0.0], -np.ones(p + q)])
+    constraints = [
+        {
+            "type": "ineq",
+            "fun": lambda x: 0.999 - np.sum(x[1:]),
+            "jac": lambda x: jac_persistence,
+        }
+    ]
+    return minimize(
+        objective,
+        x0,
+        jac=True,
+        method="SLSQP",
+        bounds=[(1e-12, None)] + [(0.0, 0.999)] * (p + q),
+        constraints=constraints,
+        options={"maxiter": 500},
+    )
+
+
+def _fit_garch_models(
+    models: list[GARCH], series: list[NDArray[np.float64]], n_jobs: int
 ) -> list[GARCH]:
-    """Fit GARCH models to a block of columns (one parallel task)."""
-    return [GARCH(p=p, q=q, mean=mean).fit(returns[:, i]) for i in cols]
+    """Fit each model to its series with one parallel numba batch.
+
+    Series where projected BFGS does not converge are refit with SLSQP
+    from its point; a RuntimeWarning is emitted only if that fails too.
+    """
+    m0 = models[0]
+    p, q = m0.p, m0.q
+    prepared = [m._prepare(r) for m, r in zip(models, series, strict=True)]
+    Z = np.stack([z for _, z, _ in prepared])
+    var0 = Z.var(axis=1)
+    starts, n_always = _garch_starts(p, q)
+    with _numba_threads(n_jobs):
+        X, F, conv = garch_fit_batch(
+            Z, starts, p, q, var0, _FIT_MAXITER, _FIT_GTOL, _FIT_FTOL, n_always
+        )
+    for i, (m, (resid, z, scale)) in enumerate(zip(models, prepared, strict=True)):
+        x, f, ok = X[i], float(F[i]), bool(conv[i])
+        if not ok:
+            result = _garch_slsqp(z, float(var0[i]), p, q, x)
+            if result.success or result.fun < f:
+                x, f, ok = result.x, float(result.fun), bool(result.success)
+            if not ok:
+                warnings.warn(
+                    f"GARCH optimizer did not converge: {result.message}",
+                    RuntimeWarning,
+                    stacklevel=3,
+                )
+        m._finish(resid, z, scale, float(var0[i]), x, f, ok)
+    return models
 
 
 def _fit_garch_columns(
     returns: NDArray[np.float64], p: int, q: int, mean: str, n_jobs: int
 ) -> list[GARCH]:
-    """Fit a univariate GARCH to every column of a (T, n) array.
-
-    Threads only help on a free-threaded (no-GIL) interpreter: the SLSQP
-    driver loop holds the GIL, so with it enabled threads just contend and
-    the fit runs serially. Columns go out in one contiguous block per
-    worker — a single fit takes ~0.5 ms, so per-column tasks would be
-    dominated by dispatch overhead.
-    """
+    """Fit a univariate GARCH to every column of a (T, n) array."""
     n = returns.shape[1]
-    gil_enabled = getattr(sys, "_is_gil_enabled", lambda: True)()
-    n_workers = 1 if gil_enabled else min(effective_n_jobs(n_jobs), n)
-    if n_workers <= 1:
-        return _fit_garch_block(returns, np.arange(n), p, q, mean)
-    blocks = Parallel(n_jobs=n_workers, prefer="threads")(
-        delayed(_fit_garch_block)(returns, cols, p, q, mean)
-        for cols in np.array_split(np.arange(n), n_workers)
-    )
-    return [m for block in blocks for m in block]
+    models = [GARCH(p=p, q=q, mean=mean) for _ in range(n)]
+    return _fit_garch_models(models, [returns[:, i] for i in range(n)], n_jobs)
 
 
 class GARCH:
@@ -159,73 +256,52 @@ class GARCH:
         """
         returns = np.asarray(returns, dtype=np.float64).flatten()
         _validate_returns(returns, min_obs=max(10, self.p + self.q + 2))
-        self._std_err = None
+        return _fit_garch_models([self], [returns], n_jobs=1)[0]
+
+    def _prepare(self, returns: NDArray[np.float64]):
+        """Demean and rescale; returns (resid, z, scale) with z = resid / scale.
+
+        The optimizer works on unit-variance z: with raw daily returns
+        omega is ~1e-6 next to alpha, beta ~0.1, which stalls optimizers
+        far from the optimum. omega scales by scale**2, alpha and beta are
+        scale-free.
+        """
+        returns = np.asarray(returns, dtype=np.float64).flatten()
         self.mu = float(returns.mean()) if self.mean == "constant" else 0.0
-        returns = returns - self.mu
-        T = len(returns)
-        scale = float(np.std(returns))
+        resid = returns - self.mu
+        scale = float(np.std(resid))
         if scale == 0.0:
             raise ValueError("returns have zero variance")
-        p, q = self.p, self.q
+        return resid, resid / scale, scale
 
-        # Optimize on unit-variance returns: with raw daily returns omega is
-        # ~1e-6 next to alpha, beta ~0.1, and SLSQP stalls far from the
-        # optimum while reporting success. omega scales by scale**2, alpha
-        # and beta are scale-free. SLSQP also degenerates silently when the
-        # objective magnitude is large, so use the per-observation average.
-        z = returns / scale
-        var0 = float(np.var(z))
-
-        def objective(params: NDArray[np.float64]) -> tuple[float, NDArray[np.float64]]:
-            nll, grad = garch_loglik_grad(z, params, p, q, var0)
-            return nll / T, grad / T
-
-        # Initial values
-        alpha0 = np.full(p, 0.05 / p)
-        beta0 = np.full(q, 0.90 / q)
-        x0 = np.concatenate([[var0 * 0.05], alpha0, beta0])
-
-        bounds = [(1e-12, None)] + [(0.0, 0.999)] * (p + q)
-        jac_persistence = np.concatenate([[0.0], -np.ones(p + q)])
-        constraints = [
-            {
-                "type": "ineq",
-                "fun": lambda x: 0.999 - np.sum(x[1:]),
-                "jac": lambda x: jac_persistence,
-            }
-        ]
-
-        result = minimize(
-            objective,
-            x0,
-            jac=True,
-            method="SLSQP",
-            bounds=bounds,
-            constraints=constraints,
-            options={"maxiter": 500},
-        )
-        if not result.success:
-            warnings.warn(
-                f"GARCH optimizer did not converge: {result.message}", RuntimeWarning, stacklevel=2
-            )
-        self.converged = bool(result.success)
-
+    def _finish(
+        self,
+        resid: NDArray[np.float64],
+        z: NDArray[np.float64],
+        scale: float,
+        var0: float,
+        x: NDArray[np.float64],
+        nll_per_obs: float,
+        converged: bool,
+    ) -> None:
+        """Store a fit given optimal unit-variance params x = (omega_z, alpha, beta)."""
+        p = self.p
+        T = len(z)
         scale2 = scale * scale
-        self.omega = float(result.x[0]) * scale2
-        self.alpha = result.x[1 : 1 + p].copy()
-        self.beta = result.x[1 + p :].copy()
-        # nll(returns) = nll(z) + T * log(scale)
-        self._nll = float(result.fun) * T + T * np.log(scale)
+        self._std_err = None
+        self.converged = converged
+        self.omega = float(x[0]) * scale2
+        self.alpha = np.array(x[1 : 1 + p])
+        self.beta = np.array(x[1 + p :])
+        # nll(resid) = nll(z) + T * log(scale)
+        self._nll = nll_per_obs * T + T * np.log(scale)
         self._z = z
         self._scale = scale
         self._var0 = var0
-        self._x_opt = result.x.copy()
+        self._x_opt = np.array(x)
         self._T = T
-
-        self.resid = returns.copy()
-        self.sigma2 = scale2 * garch_variance_loop(z, result.x[0], self.alpha, self.beta, var0)
-
-        return self
+        self.resid = resid
+        self.sigma2 = scale2 * garch_variance_loop(z, float(x[0]), self.alpha, self.beta, var0)
 
     def _objective(self, x: NDArray[np.float64]) -> float:
         """Negative log-likelihood in the unit-variance parametrization."""
@@ -343,8 +419,8 @@ class CCC:
         Args:
             p: ARCH order for univariate GARCH models
             q: GARCH order for univariate GARCH models
-            n_jobs: Number of threads for GARCH fitting (-1 = all cores); only
-                used on a free-threaded (no-GIL) Python, serial otherwise
+            n_jobs: Number of threads for the numba fitting kernels
+                (-1 = all cores); works with or without the GIL
             low_memory: If True, only store final covariance matrix (not full path)
             mean: mean model for the univariate fits ("zero" or "constant")
             shrinkage: shrink the correlation matrix toward identity,
@@ -521,8 +597,8 @@ class DCC:
         Args:
             p: ARCH order for univariate GARCH models
             q: GARCH order for univariate GARCH models
-            n_jobs: Number of threads for GARCH fitting (-1 = all cores); only
-                used on a free-threaded (no-GIL) Python, serial otherwise
+            n_jobs: Number of threads for the numba fitting kernels
+                (-1 = all cores); works with or without the GIL
             low_memory: If True, only store final covariance/correlation matrices
             mean: mean model for the univariate fits ("zero" or "constant")
             method: second-stage estimator — "full" exact likelihood
@@ -616,30 +692,33 @@ class DCC:
         bounds = [(1e-8, 0.999), (1e-8, 0.999)]
         constraints = [{"type": "ineq", "fun": lambda x: 0.999 - x[0] - x[1]}]
 
-        result = minimize(
-            objective,
-            x0,
-            method="SLSQP",
-            bounds=bounds,
-            constraints=constraints,
-            options={"maxiter": 200},
-        )
-        if not result.success:
-            warnings.warn(
-                f"DCC optimizer did not converge: {result.message}", RuntimeWarning, stacklevel=2
+        with _numba_threads(self.n_jobs):
+            result = minimize(
+                objective,
+                x0,
+                method="SLSQP",
+                bounds=bounds,
+                constraints=constraints,
+                options={"maxiter": 200},
             )
-        self.converged = bool(result.success)
-        self.a, self.b = float(result.x[0]), float(result.x[1])
+            if not result.success:
+                warnings.warn(
+                    f"DCC optimizer did not converge: {result.message}",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
+            self.converged = bool(result.success)
+            self.a, self.b = float(result.x[0]), float(result.x[1])
 
-        # Compute covariance matrices
-        if self.low_memory:
-            self.R, self.H, self.Q_last = dcc_final_covariance(
-                std_resid, sigmas, self.Q_bar, self.a, self.b
-            )
-        else:
-            self.R, self.H, self.Q_last = dcc_covariance_loop(
-                std_resid, sigmas, self.Q_bar, self.a, self.b
-            )
+            # Compute covariance matrices
+            if self.low_memory:
+                self.R, self.H, self.Q_last = dcc_final_covariance(
+                    std_resid, sigmas, self.Q_bar, self.a, self.b
+                )
+            else:
+                self.R, self.H, self.Q_last = dcc_covariance_loop(
+                    std_resid, sigmas, self.Q_bar, self.a, self.b
+                )
 
         return self
 
@@ -697,8 +776,7 @@ class DCC:
         _check_fitted(self.H is not None)
         return "\n".join(
             [
-                f"DCC({self.p}, {self.q})  T={self._T}  n={self._n_assets}"
-                f"  method={self.method_}",
+                f"DCC({self.p}, {self.q})  T={self._T}  n={self._n_assets}  method={self.method_}",
                 f"  a: {self.a:.4f}  b: {self.b:.4f}  a+b: {self.a + self.b:.4f}",
                 f"  shrinkage: {self.shrinkage}",
                 f"  loglik: {self.loglik_:.2f}  AIC: {self.aic:.2f}  BIC: {self.bic:.2f}",

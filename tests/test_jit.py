@@ -3,7 +3,16 @@
 import numpy as np
 import pytest
 
-from multigarch._jit import dcc_cl_loglik, dcc_loglik_loop, garch_loglik, garch_loglik_grad
+from multigarch._jit import (
+    _MAX_PERSISTENCE,
+    _projected_gradient_norm,
+    dcc_cl_loglik,
+    dcc_loglik_loop,
+    garch_fit_projected,
+    garch_loglik,
+    garch_loglik_grad,
+    garch_project,
+)
 
 
 def _numpy_dcc_nll(std_resid, Q_bar, a, b):
@@ -85,3 +94,58 @@ def test_garch_grad_matches_value_and_finite_differences(pq):
     h = 1e-6
     fd = np.array([(f(x + h * e) - f(x - h * e)) / (2 * h) for e in np.eye(len(x))])
     np.testing.assert_allclose(grad, fd, rtol=1e-5, atol=1e-6)
+
+
+def test_garch_project_matches_brute_force_qp():
+    from scipy.optimize import minimize
+
+    rng = np.random.default_rng(7)
+    for _ in range(50):
+        k1 = int(rng.integers(2, 6))
+        x = rng.normal(0.3, 0.6, k1)
+        out = np.empty(k1)
+        garch_project(x, out)
+        ref = minimize(
+            lambda y, x=x: ((y - x) ** 2).sum(),
+            np.full(k1, 0.01),
+            method="SLSQP",
+            bounds=[(1e-12, None)] + [(0.0, None)] * (k1 - 1),
+            constraints=[{"type": "ineq", "fun": lambda y: _MAX_PERSISTENCE - y[1:].sum()}],
+            options={"ftol": 1e-14},
+        )
+        np.testing.assert_allclose(out, ref.x, atol=1e-6)
+        assert out[1:].min() >= 0.0
+        assert out[1:].sum() <= _MAX_PERSISTENCE + 1e-12
+
+
+def _fit_projected(r, x0, p, q):
+    z = r / r.std()
+    x, f, ok = garch_fit_projected(z, np.asarray(x0, dtype=np.float64), p, q, 1.0, 500, 1e-7, 1e-10)
+    g = garch_loglik_grad(z, x, p, q, 1.0)[1] / len(z)
+    return x, ok, _projected_gradient_norm(x, g, np.empty(len(x)))
+
+
+def test_projected_fit_reaches_alpha_boundary_exactly():
+    # For this white-noise draw the MLE has alpha = 0 on the boundary,
+    # which the projection reaches exactly
+    r = np.random.default_rng(8).standard_normal(3000)
+    x, ok, pg = _fit_projected(r, [0.05, 0.05, 0.90], 1, 1)
+    assert ok
+    assert x[1] == 0.0
+    assert pg < 1e-4
+
+
+def test_projected_fit_respects_persistence_cap():
+    # Integrated-variance data push persistence to the cap
+    rng = np.random.default_rng(9)
+    T = 3000
+    r = np.empty(T)
+    s2 = 1.0
+    for t in range(T):
+        r[t] = np.sqrt(s2) * rng.standard_normal()
+        s2 = 0.002 + 0.12 * r[t] ** 2 + 0.8799 * s2
+    x, ok, pg = _fit_projected(r, [0.05, 0.05, 0.90], 1, 1)
+    assert ok
+    assert x[1:].sum() == pytest.approx(_MAX_PERSISTENCE, abs=1e-9)
+    assert pg < 1e-4
+
