@@ -159,7 +159,7 @@ def test_parallel_fit_matches_serial(n_jobs):
     returns = np.random.default_rng(31).standard_normal((300, 7)) * 0.01
     serial = DCC(n_jobs=1).fit(returns)
     par = DCC(n_jobs=n_jobs).fit(returns)
-    for g_s, g_p in zip(serial.garch_models, par.garch_models):
+    for g_s, g_p in zip(serial.garch_models, par.garch_models, strict=True):
         assert g_p.omega == g_s.omega
         np.testing.assert_array_equal(g_p.sigma2, g_s.sigma2)
     assert (par.a, par.b) == (serial.a, serial.b)
