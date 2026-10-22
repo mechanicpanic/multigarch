@@ -81,18 +81,20 @@ T=2000, `low_memory=True`, times in seconds:
 
 | n | CCC | DCC (cl) | DCC (full) |
 |---|-----|----------|------------|
-| 10 | 0.001 | 0.002 | 0.010 |
-| 50 | 0.005 | 0.007 | 0.26 |
-| 100 | 0.010 | 0.012 | — |
-| 300 | 0.029 | 0.036 | — |
+| 10 | 0.002 | 0.003 | 0.008 |
+| 50 | 0.005 | 0.007 | 0.040 |
+| 100 | 0.010 | 0.012 | 0.19 |
+| 300 | 0.031 | 0.038 | — |
 
-The full likelihood is O(T·n³) per optimizer evaluation and is skipped above
-n=50; the composite likelihood scales linearly in n.
+The full likelihood is O(T·n³) per optimizer evaluation (parallel over time
+blocks) and is skipped above n=100; the composite likelihood scales linearly
+in n.
 
 On real data (CRSP daily returns, 500 most liquid common shares with
 complete 2019–2023 history, T=1258 — see `benchmarks/bench_crsp.py`):
 `DCC(method="cl")` fits n=500 in ~0.06 s on 14 cores (~0.25 s on one)
-with a=0.025, b=0.930.
+with a=0.025, b=0.930. `loglik_` (and so `summary()`) evaluates the full
+likelihood once — ~0.8 s at n=500.
 
 ## License
 

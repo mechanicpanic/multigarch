@@ -57,7 +57,7 @@ def main() -> None:
     parser.add_argument("--sizes", default="30,100,300,500")
     args = parser.parse_args()
     sizes = [int(s) for s in args.sizes.split(",")]
-    full_max_n = 50  # full likelihood is O(T*n^3); skip above this
+    full_max_n = 100  # full likelihood is O(T*n^3); skip above this
 
     t0 = time.perf_counter()
     df = load_returns(args.path, args.start, args.end)

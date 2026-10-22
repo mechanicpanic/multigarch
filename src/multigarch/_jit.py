@@ -486,38 +486,38 @@ def garch_fit_batch(
     return out, nll, conv
 
 
+# dcc_loglik_loop splits time into this many parallel blocks (fixed, so
+# results are independent of the thread count), keeping a Q snapshot per
+# block start; snapshots are capped in total, which lowers the count at
+# large n
+_DCC_TIME_BLOCKS = 64
+_DCC_SNAPSHOT_BYTES = 64 * 1024 * 1024
+
+
 @njit(cache=True, nogil=True)
-def dcc_loglik_loop(
+def _dcc_nll_block(
     std_resid: np.ndarray,
     Q_bar: np.ndarray,
     a: float,
     b: float,
+    Q: np.ndarray,
+    t0: int,
+    t1: int,
 ) -> float:
-    """DCC negative log-likelihood: 0.5 * sum_{t>=1}(log|R_t| + e' R_t^-1 e).
+    """Sum of log|R_t| + e_t' R_t^-1 e_t over t in [t0, t1).
 
-    Allocation-free inner loop. The Cholesky pivot floor keeps the value
-    finite (and large, via the exploding quadratic form) for near-singular
-    R instead of raising.
-
-    Args:
-        std_resid: Standardized residuals (T, n)
-        Q_bar: Unconditional correlation matrix (n, n)
-        a: DCC a parameter
-        b: DCC b parameter
-
-    Returns:
-        Negative log-likelihood
+    ``Q`` holds Q_{t0-1} on entry and is advanced in place. The Cholesky
+    pivot floor keeps the value finite (and large, via the exploding
+    quadratic form) for near-singular R instead of raising.
     """
-    T, n = std_resid.shape
+    n = std_resid.shape[1]
     one_minus_ab = 1.0 - a - b
-
-    Q = Q_bar.copy()
     L = np.zeros((n, n))
     y = np.zeros(n)
     d = np.zeros(n)
 
     ll = 0.0
-    for t in range(1, T):
+    for t in range(t0, t1):
         for i in range(n):
             ei = std_resid[t - 1, i]
             for j in range(n):
@@ -529,12 +529,27 @@ def dcc_loglik_loop(
                 qi = 1e-12
             d[i] = 1.0 / np.sqrt(qi)
 
-        # Cholesky of R = D Q D, built element-wise from Q without forming R
+        # Cholesky of R = D Q D, built element-wise from Q without forming
+        # R. Four accumulators give the row dot products instruction-level
+        # parallelism (a single running sum cannot vectorize without
+        # fastmath).
         for i in range(n):
             for j in range(i + 1):
-                s = Q[i, j] * d[i] * d[j]
-                for k in range(j):
-                    s -= L[i, k] * L[j, k]
+                acc0 = 0.0
+                acc1 = 0.0
+                acc2 = 0.0
+                acc3 = 0.0
+                k = 0
+                while k + 4 <= j:
+                    acc0 += L[i, k] * L[j, k]
+                    acc1 += L[i, k + 1] * L[j, k + 1]
+                    acc2 += L[i, k + 2] * L[j, k + 2]
+                    acc3 += L[i, k + 3] * L[j, k + 3]
+                    k += 4
+                while k < j:
+                    acc0 += L[i, k] * L[j, k]
+                    k += 1
+                s = Q[i, j] * d[i] * d[j] - ((acc0 + acc1) + (acc2 + acc3))
                 if i == j:
                     if s < 1e-10:
                         s = 1e-10
@@ -556,6 +571,76 @@ def dcc_loglik_loop(
 
         ll += logdet + quad
 
+    return ll
+
+
+@njit(cache=True, nogil=True, parallel=True)
+def dcc_loglik_loop(
+    std_resid: np.ndarray,
+    Q_bar: np.ndarray,
+    a: float,
+    b: float,
+) -> float:
+    """DCC negative log-likelihood: 0.5 * sum_{t>=1}(log|R_t| + e' R_t^-1 e).
+
+    The per-step O(n^3) Cholesky work is independent across t once Q_t
+    is known, so time is split into ``_DCC_TIME_BLOCKS`` blocks run in
+    parallel — a fixed count, so the result does not depend on the
+    thread count. A first pass
+    runs the cheap O(n^2) Q recursion (parallel over rows — each element
+    has its own scalar recursion) and snapshots Q at the block starts;
+    snapshots are capped at ``_DCC_SNAPSHOT_BYTES``, which bounds the
+    block count at large n. Q values match the sequential recursion
+    exactly; summation order differs from a sequential pass, which only
+    matters (beyond ~1e-10 relative) for singular Q_bar, where the pivot
+    floor makes the value huge and rounding-sensitive anyway.
+
+    Args:
+        std_resid: Standardized residuals (T, n)
+        Q_bar: Unconditional correlation matrix (n, n)
+        a: DCC a parameter
+        b: DCC b parameter
+
+    Returns:
+        Negative log-likelihood
+    """
+    T, n = std_resid.shape
+    if T < 2:
+        return 0.0
+    one_minus_ab = 1.0 - a - b
+
+    nb = min(_DCC_TIME_BLOCKS, T - 1, max(1, _DCC_SNAPSHOT_BYTES // (8 * n * n)))
+    starts = np.empty(nb + 1, dtype=np.int64)
+    for k in range(nb + 1):
+        starts[k] = 1 + ((T - 1) * k) // nb
+
+    # Pass 1: snaps[k] = Q_{starts[k] - 1}
+    snaps = np.empty((nb, n, n))
+    for i in prange(n):
+        c = np.empty(n)
+        q = np.empty(n)
+        for j in range(n):
+            c[j] = one_minus_ab * Q_bar[i, j]
+            q[j] = Q_bar[i, j]
+        k = 0
+        for t in range(0, starts[nb - 1]):
+            if t > 0:
+                ai = a * std_resid[t - 1, i]
+                for j in range(n):
+                    q[j] = c[j] + ai * std_resid[t - 1, j] + b * q[j]
+            while k < nb and starts[k] - 1 == t:
+                for j in range(n):
+                    snaps[k, i, j] = q[j]
+                k += 1
+
+    # Pass 2: Cholesky work per time block
+    parts = np.empty(nb)
+    for k in prange(nb):
+        parts[k] = _dcc_nll_block(std_resid, Q_bar, a, b, snaps[k], starts[k], starts[k + 1])
+
+    ll = 0.0
+    for k in range(nb):
+        ll += parts[k]
     return 0.5 * ll
 
 

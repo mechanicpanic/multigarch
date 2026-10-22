@@ -30,7 +30,7 @@ def main():
     quick = "--quick" in sys.argv
     T = 500 if quick else 2000
     sizes = [5, 10] if quick else [10, 50, 100, 300]
-    full_max_n = 50  # full likelihood is O(T*n^3); skip above this
+    full_max_n = 100  # full likelihood is O(T*n^3); skip above this
 
     # Warm up JIT compilation so timings measure the algorithms
     warm = simulate(200, 3, seed=1)

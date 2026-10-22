@@ -165,3 +165,29 @@ def test_dcc_final_covariance_matches_path_last_step(n):
     np.testing.assert_allclose(R, R_path[-1], rtol=1e-12, atol=1e-14)
     np.testing.assert_allclose(H, H_path[-1], rtol=1e-12, atol=1e-14)
     np.testing.assert_array_equal(Q, Q.T)
+
+
+@pytest.mark.parametrize("n", [1, 3, 8])
+@pytest.mark.parametrize("T", [2, 3, 70, 401])
+def test_full_loglik_independent_of_thread_count(n, T):
+    import numba
+
+    e = np.random.default_rng(11).standard_normal((T, n))
+    Q_bar = np.corrcoef(e.T) if n > 1 and T > n else np.eye(n)
+    prev = numba.get_num_threads()
+    try:
+        vals = set()
+        for k in sorted({1, 2, prev}):
+            numba.set_num_threads(k)
+            vals.add(dcc_loglik_loop(e, Q_bar, 0.05, 0.90))
+    finally:
+        numba.set_num_threads(prev)
+    assert len(vals) == 1
+
+
+def test_full_loglik_finite_for_singular_target():
+    rng = np.random.default_rng(12)
+    e = rng.standard_normal((200, 5))
+    e[:, 4] = e[:, 3]  # rank-deficient Q_bar: the Cholesky pivot floor engages
+    val = dcc_loglik_loop(e, np.corrcoef(e.T), 0.05, 0.90)
+    assert np.isfinite(val)

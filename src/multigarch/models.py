@@ -733,8 +733,8 @@ class DCC:
 
         Always evaluates the FULL correlation likelihood once at the fitted
         (a, b), regardless of estimation method; the correlation part
-        conditions on the first observation. One O(T*n^3) pass — a few
-        seconds at n=500.
+        conditions on the first observation. One O(T*n^3) pass, parallel
+        over time blocks — under a second at n=500 on 14 cores.
         """
         _check_fitted(self.H is not None)
         if self._loglik is None:
