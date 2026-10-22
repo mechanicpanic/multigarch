@@ -7,6 +7,8 @@ from multigarch._jit import (
     _MAX_PERSISTENCE,
     _projected_gradient_norm,
     dcc_cl_loglik,
+    dcc_covariance_loop,
+    dcc_final_covariance,
     dcc_loglik_loop,
     garch_fit_projected,
     garch_loglik,
@@ -149,3 +151,17 @@ def test_projected_fit_respects_persistence_cap():
     assert x[1:].sum() == pytest.approx(_MAX_PERSISTENCE, abs=1e-9)
     assert pg < 1e-4
 
+
+@pytest.mark.parametrize("n", [1, 2, 5, 8, 33])
+def test_dcc_final_covariance_matches_path_last_step(n):
+    # Parallel row-paired kernel vs the sequential full-path kernel
+    rng = np.random.default_rng(10)
+    e = rng.standard_normal((120, n))
+    sig = np.abs(rng.standard_normal((120, n))) + 0.1
+    Q_bar = np.corrcoef(e.T) if n > 1 else np.ones((1, 1))
+    R, H, Q = dcc_final_covariance(e, sig, Q_bar, 0.04, 0.93)
+    R_path, H_path, Q_path = dcc_covariance_loop(e, sig, Q_bar, 0.04, 0.93)
+    np.testing.assert_allclose(Q, Q_path, rtol=1e-12, atol=1e-14)
+    np.testing.assert_allclose(R, R_path[-1], rtol=1e-12, atol=1e-14)
+    np.testing.assert_allclose(H, H_path[-1], rtol=1e-12, atol=1e-14)
+    np.testing.assert_array_equal(Q, Q.T)

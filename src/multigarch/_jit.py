@@ -676,7 +676,7 @@ def dcc_covariance_loop(
     return R, H, Q
 
 
-@njit(cache=True, nogil=True)
+@njit(cache=True, nogil=True, parallel=True)
 def dcc_final_covariance(
     std_resid: np.ndarray,
     sigmas: np.ndarray,
@@ -686,7 +686,10 @@ def dcc_final_covariance(
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Compute only the final DCC correlation and covariance matrices.
 
-    Memory-efficient version that doesn't store the full path.
+    Memory-efficient version that doesn't store the full path. Each
+    Q[i, j] follows its own scalar recursion, so rows of the lower
+    triangle (Q is symmetric) run in parallel, paired (k, n-1-k) to
+    balance work; within a row the update is vectorized across j.
 
     Args:
         std_resid: Standardized residuals (T, n)
@@ -699,15 +702,27 @@ def dcc_final_covariance(
         (R_final, H_final, Q_last), each of shape (n, n)
     """
     T, n = std_resid.shape
-
-    Q = Q_bar.copy()
     one_minus_ab = 1.0 - a - b
 
-    for t in range(1, T):
-        for i in range(n):
-            ei = std_resid[t - 1, i]
-            for j in range(n):
-                Q[i, j] = one_minus_ab * Q_bar[i, j] + a * ei * std_resid[t - 1, j] + b * Q[i, j]
+    Q = np.empty((n, n))
+    for k in prange((n + 1) // 2):
+        c = np.empty(n)
+        qrow = np.empty(n)
+        for r in range(2):
+            i = k + r * (n - 1 - 2 * k)
+            if r == 1 and i == k:  # middle row of an odd n
+                continue
+            m = i + 1
+            for j in range(m):
+                c[j] = one_minus_ab * Q_bar[i, j]
+                qrow[j] = Q_bar[i, j]
+            for t in range(1, T):
+                ai = a * std_resid[t - 1, i]
+                for j in range(m):
+                    qrow[j] = c[j] + ai * std_resid[t - 1, j] + b * qrow[j]
+            for j in range(m):
+                Q[i, j] = qrow[j]
+                Q[j, i] = qrow[j]
 
     R_final = np.zeros((n, n))
     H_final = np.zeros((n, n))

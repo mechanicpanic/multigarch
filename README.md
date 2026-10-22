@@ -5,7 +5,8 @@ Simple Multivariate GARCH models for Python 3.10+.
 Features:
 - JIT-compiled inner loops (numba)
 - Composite-likelihood DCC estimation — practical at hundreds of assets
-- Parallel GARCH fitting (joblib threads, GIL-releasing kernels)
+- Parallel univariate GARCH fitting in numba (projected BFGS, all cores,
+  with or without the GIL)
 - Configurable GARCH(p,q) orders, diagnostics (loglik/AIC/BIC/std errors)
 
 ## Installation
@@ -57,9 +58,7 @@ dcc = DCC(p=2, q=1, n_jobs=4).fit(returns)
 
 - `p`, `q`: ARCH / GARCH orders (default 1)
 - `mean`: `"zero"` (default) or `"constant"` (demean, stores `mu`)
-- `n_jobs`: threads for the univariate fits, -1 = all cores (CCC/DCC).
-  Only effective on a free-threaded Python (`3.13t`/`3.14t`); with the GIL
-  enabled the fits run serially, since threads would only contend
+- `n_jobs`: threads for the numba kernels, -1 = all cores (CCC/DCC)
 - `low_memory`: store only the final covariance/correlation instead of the
   full (T, n, n) paths. Storing both R and H paths costs `2·T·n²·8` bytes —
   about 8 GB at T=2000, n=500 — so use `low_memory=True` at large n.
@@ -77,22 +76,23 @@ no sandwich correction). Non-convergence emits a `RuntimeWarning`.
 
 ## Benchmarks
 
-`uv run python benchmarks/bench.py` — Apple Silicon, single run,
+`uv run python benchmarks/bench.py` — Apple Silicon (14 cores), best of 3,
 T=2000, `low_memory=True`, times in seconds:
 
 | n | CCC | DCC (cl) | DCC (full) |
 |---|-----|----------|------------|
-| 10 | 0.02 | 0.02 | 0.02 |
-| 50 | 0.04 | 0.04 | 0.30 |
-| 100 | 0.05 | 0.06 | — |
-| 300 | 0.15 | 0.20 | — |
+| 10 | 0.001 | 0.002 | 0.010 |
+| 50 | 0.005 | 0.007 | 0.26 |
+| 100 | 0.010 | 0.012 | — |
+| 300 | 0.029 | 0.036 | — |
 
 The full likelihood is O(T·n³) per optimizer evaluation and is skipped above
 n=50; the composite likelihood scales linearly in n.
 
 On real data (CRSP daily returns, 500 most liquid common shares with
 complete 2019–2023 history, T=1258 — see `benchmarks/bench_crsp.py`):
-`DCC(method="cl")` fits n=500 in ~0.4 s with a=0.025, b=0.930.
+`DCC(method="cl")` fits n=500 in ~0.06 s on 14 cores (~0.25 s on one)
+with a=0.025, b=0.930.
 
 ## License
 
