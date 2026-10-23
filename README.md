@@ -15,6 +15,15 @@ Features:
 pip install multigarch
 ```
 
+or the development version straight from GitHub:
+
+```bash
+pip install git+https://github.com/mechanicpanic/multigarch
+```
+
+Works on free-threaded Python (`3.13t`/`3.14t`) as well; parallelism
+comes from numba threads either way.
+
 ## Usage
 
 ```python

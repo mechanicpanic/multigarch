@@ -6,6 +6,8 @@ correlation) — with numba-JIT inner loops. DCC scales to hundreds of
 assets via a pairwise composite-likelihood estimator (`method="cl"`,
 chosen automatically for n > 25).
 
+Install with `pip install multigarch`.
+
 Quickstart:
 
 ```python
@@ -22,8 +24,9 @@ print(dcc.summary())
 ```
 
 Model fit diagnostics are available on every model: `loglik_`, `aic`,
-`bic`, `std_err`, `summary()`. See the class docs for options
-(`mean`, `shrinkage`, `method`, `low_memory`, `n_jobs`).
+`bic`, `summary()`; `GARCH` and `DCC` also have `std_err`. See the class
+docs for options (`mean`, `shrinkage`, `method`, `low_memory`,
+`n_jobs` — numba threads for the fitting kernels).
 
 Project home: https://github.com/mechanicpanic/multigarch
 """
