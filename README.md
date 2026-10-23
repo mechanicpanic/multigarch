@@ -1,14 +1,19 @@
 # multigarch
 
-Simple Multivariate GARCH models for Python 3.10+.
+Multivariate GARCH models for Python: GARCH / GJR-GARCH, CCC and DCC, with
+value at risk and VaR backtesting.
 
-Features:
-- JIT-compiled inner loops (numba)
-- Composite-likelihood DCC estimation — practical at hundreds of assets
-- Parallel univariate GARCH fitting in numba (projected BFGS, all cores,
-  with or without the GIL)
-- GARCH(p,q) and GJR-GARCH(p,o,q) (leverage effect), normal or Student-t
-  innovations; diagnostics (loglik/AIC/BIC/std errors)
+- **DCC at hundreds of assets** — composite-likelihood estimation, 500
+  stocks in ~0.06 s
+- **GJR asymmetry and Student-t innovations** for the volatility models
+- **VaR and expected shortfall** for single assets and portfolios, plus
+  rolling backtests with Kupiec and Christoffersen tests
+- **Fast**: numba kernels, parallel across assets, with or without the GIL;
+  20–70× faster than R's `rmgarch` on DCC
+- **Installs anywhere**: pure Python + numba, no compiler needed —
+  including free-threaded Python (3.13t/3.14t)
+
+Documentation: https://mechanicpanic.github.io/multigarch/
 
 ## Installation
 
@@ -16,113 +21,77 @@ Features:
 pip install multigarch
 ```
 
-or the development version straight from GitHub:
+or the development version from GitHub:
 
 ```bash
 pip install git+https://github.com/mechanicpanic/multigarch
 ```
 
-Works on free-threaded Python (`3.13t`/`3.14t`) as well; parallelism
-comes from numba threads either way.
-
-## Usage
+## Quickstart
 
 ```python
 import numpy as np
 from multigarch import GARCH, CCC, DCC
+from multigarch.backtest import rolling_var
 
-# Generate sample returns (T periods, n assets)
-returns = np.random.randn(500, 30) * 0.02
+returns = np.random.default_rng(0).standard_normal((1500, 10)) * 0.01  # (T, n)
 
-# Univariate GARCH(1,1)
-garch = GARCH().fit(returns[:, 0])
-garch.forecast(horizon=5)
+# One asset: GJR-GARCH(1,1,1) with Student-t innovations
+g = GARCH(o=1, dist="t").fit(returns[:, 0])
+print(g.summary())
+g.forecast(5)                  # variance forecasts
+g.value_at_risk(0.99)          # 1-day 99% VaR, as a positive loss
+g.expected_shortfall(0.975)
 
-# GJR-GARCH(1,1,1) with Student-t innovations — the usual choice for equity VaR
-gjr = GARCH(o=1, dist="t").fit(returns[:, 0])
-gjr.gamma, gjr.nu  # leverage coefficient, degrees of freedom
+# Many assets: GJR-t margins + dynamic correlations
+dcc = DCC(o=1, dist="t", low_memory=True).fit(returns)
+dcc.a, dcc.b                   # correlation dynamics
+dcc.forecast(5)                # (5, 10, 10) covariance forecasts
+w = np.full(10, 0.1)
+dcc.portfolio_value_at_risk(w, 0.99)
 
-# CCC: Constant Conditional Correlation (fastest)
+# Constant correlations: the fastest multivariate model
 ccc = CCC().fit(returns)
 
-# DCC: Dynamic Conditional Correlation
-# method="auto" (default) uses the exact likelihood for n <= 25 and the
-# pairwise composite likelihood above that
-dcc = DCC().fit(returns)
-dcc.forecast(horizon=5)  # shape: (5, 30, 30)
-
-# Access results
-dcc.H  # time-varying covariances (T, n, n)
-dcc.R  # time-varying correlations (T, n, n)
-ccc.R  # constant correlation matrix (n, n)
-
-# Configure the univariate models and parallelism
-dcc = DCC(p=2, q=1, o=1, dist="t", n_jobs=4).fit(returns)
+# Out-of-sample VaR backtest
+bt = rolling_var(returns[:, 0], GARCH(o=1, dist="t"), window=1000)
+print(bt.summary())            # hit rate, Kupiec, Christoffersen
 ```
+
+A complete VaR workflow — model comparison, portfolio VaR, backtest — is in
+[`examples/var_backtest.py`](examples/var_backtest.py).
 
 ## Models
 
-| Model | Description | Cost per likelihood eval |
-|-------|-------------|--------------------------|
-| `GARCH(p,q)` | Univariate GARCH / GJR-GARCH (`o > 0`) | O(T) |
-| `CCC(p,q)` | Constant Conditional Correlation | no correlation optimization |
-| `DCC(p,q)` | Dynamic Conditional Correlation | O(T·n³) full / O(T·n) composite |
+| Model | What it models |
+|---|---|
+| `GARCH(p, q, o=0, dist="normal")` | one series; `o > 0` adds GJR asymmetry (leverage effect), `dist="t"` Student-t innovations |
+| `CCC(...)` | univariate models per asset + constant correlation |
+| `DCC(...)` | univariate models per asset + dynamic correlation (Engle, 2002) |
 
-## Options
+Main options (CCC and DCC take the univariate ones too):
 
-- `p`, `q`: ARCH / GARCH orders (default 1)
-- `o`: asymmetric (GJR) order, default 0. Adds `γ·ε²·1[ε<0]` terms, γ ≥ 0;
-  stationarity `Σα + Σβ + ½Σγ < 0.999` is enforced
-- `dist`: `"normal"` (default) or `"t"` (Student-t, degrees of freedom `nu`
-  estimated in [2.1, 200]). In CCC/DCC this sets the margins; the
-  correlation stage is a Gaussian quasi-likelihood either way
-- `mean`: `"zero"` (default) or `"constant"` (demean, stores `mu`)
-- `n_jobs`: threads for the numba kernels, -1 = all cores (CCC/DCC)
-- `low_memory`: store only the final covariance/correlation instead of the
-  full (T, n, n) paths. Storing both R and H paths costs `2·T·n²·8` bytes —
-  about 8 GB at T=2000, n=500 — so use `low_memory=True` at large n.
-- `method` (DCC): `"full"` exact likelihood, `"cl"` pairwise composite
-  likelihood (recommended for large n: less biased and dramatically faster),
-  `"auto"` (default) picks `"cl"` when n > 25.
-- `shrinkage` (CCC/DCC): shrink the correlation target toward identity,
-  `Q̄ ← (1−δ)·S + δ·I`. Use δ > 0 when T is not much larger than n.
+| Option | Meaning |
+|---|---|
+| `p`, `q`, `o` | ARCH, GARCH and GJR orders (default 1, 1, 0) |
+| `dist` | `"normal"` or `"t"` (degrees of freedom estimated) |
+| `mean` | `"zero"` or `"constant"` |
+| `method` (DCC) | `"full"` likelihood, `"cl"` composite likelihood, `"auto"`: `"cl"` for n > 25 |
+| `shrinkage` | shrink the correlation target toward identity; use when T is not ≫ n |
+| `low_memory` | keep only the final covariance, not the (T, n, n) path |
+| `n_jobs` | numba threads, -1 = all cores |
 
-## Diagnostics
-
-After fitting: `loglik_`, `aic`, `bic`, `summary()` on all models;
-`std_err` on `GARCH` (per-parameter) and `DCC` (for `a`, `b`; approximate —
-no sandwich correction). Non-convergence emits a `RuntimeWarning`.
-
-## Benchmarks
-
-All timings on an Apple M4 Pro (10 performance + 4 efficiency cores),
-best of 3.
-
-`uv run python benchmarks/bench.py` — simulated returns, T=2000,
-`low_memory=True`, times in seconds:
-
-| n | CCC | DCC (cl) | DCC (full) |
-|---|-----|----------|------------|
-| 10 | 0.002 | 0.003 | 0.008 |
-| 50 | 0.006 | 0.008 | 0.037 |
-| 100 | 0.016 | 0.019 | 0.18 |
-| 300 | 0.036 | 0.043 | — |
-
-The full likelihood is O(T·n³) per optimizer evaluation (parallel over time
-blocks) and is skipped above n=100; the composite likelihood scales linearly
-in n.
-
-On real data (CRSP daily returns, 500 most liquid common shares with
-complete 2019–2023 history, T=1258 — see `benchmarks/bench_crsp.py`):
-`DCC(method="cl")` fits n=500 in ~0.06 s on all cores (~0.4 s on one)
-with a=0.025, b=0.930; with GJR-t margins in ~0.13 s. `loglik_` (and so
-`summary()`) evaluates the full likelihood once — ~0.8 s at n=500.
+After fitting: `loglik_`, `aic`, `bic`, `summary()`, `forecast()`;
+`std_err` on `GARCH` and `DCC`; `value_at_risk` / `expected_shortfall`
+(`GARCH`) and `portfolio_value_at_risk` / `portfolio_expected_shortfall`
+(`CCC`, `DCC`). The [documentation](https://mechanicpanic.github.io/multigarch/)
+has the model equations, estimation details and references.
 
 ## Comparison
 
-**R `rmgarch`** (the reference DCC implementation) — `benchmarks/bench_vs_rmgarch.R`
-and `.py`: two-step DCC(1,1), GARCH(1,1)-normal margins, full likelihood,
-first n CRSP stocks above, seconds:
+**R `rmgarch`** — the reference DCC implementation. Two-step DCC(1,1) with
+GARCH(1,1)-normal margins and the full likelihood, on the first n of the
+CRSP stocks below (`benchmarks/bench_vs_rmgarch.R` and `.py`), seconds:
 
 | n | rmgarch | multigarch, 1 thread | multigarch, all cores | a, b rmgarch | a, b multigarch |
 |---|---|---|---|---|---|
@@ -132,18 +101,43 @@ first n CRSP stocks above, seconds:
 | 50 | 4.99 | 0.91 | 0.13 | 0.0054, 0.9438 | 0.0060, 0.9345 |
 | 100 | 32.4 | 4.0 | 0.50 | 0.0056, 0.8174 | 0.0058, 0.8120 |
 
-Estimates agree; rmgarch's (a, b) never scores better than multigarch's
+Estimates agree, and rmgarch's (a, b) never score better than multigarch's
 on multigarch's second-stage likelihood. rmgarch has no composite
-likelihood, so n=500 is out of its reach in practice.
+likelihood, which puts n = 500 out of practical reach.
 
-**Python `arch`** (univariate only; no multivariate models) —
-`benchmarks/bench_vs_arch.py`, 500 CRSP stocks: multigarch fits
-GARCH(1,1)-normal in 0.7 ms vs 4.3 ms and GJR(1,1,1)-t in 2.0 ms vs
-9.2 ms per series (and fits all series in parallel inside CCC/DCC). The
-packages initialize σ² differently, so each fit is scored on both
-likelihoods: arch's estimates beat multigarch's on multigarch's own
-likelihood only on series where arch leaves multigarch's parameter set
-(γ < 0, persistence above 0.999).
+**Python `arch`** — univariate models only (no multivariate). On 500 CRSP
+stocks (`benchmarks/bench_vs_arch.py`) multigarch fits GARCH(1,1)-normal in
+0.7 ms vs 4.3 ms and GJR(1,1,1)-t in 2.0 ms vs 9.2 ms per series, and fits
+all series in parallel inside CCC/DCC. The packages initialize σ²
+differently, so each fit is scored on both likelihoods: arch's estimates
+beat multigarch's on multigarch's own likelihood only where arch leaves
+multigarch's parameter set (γ < 0 or persistence above 0.999). arch ships
+a compiled extension; on free-threaded Python it has no wheels and builds
+from source, and it re-enables the GIL on import.
+
+## Benchmarks
+
+Apple M4 Pro (10 performance + 4 efficiency cores), best of 3.
+
+`uv run python benchmarks/bench.py` — simulated returns, T=2000,
+`low_memory=True`, seconds:
+
+| n | CCC | DCC (cl) | DCC (full) |
+|---|-----|----------|------------|
+| 10 | 0.002 | 0.003 | 0.008 |
+| 50 | 0.006 | 0.008 | 0.037 |
+| 100 | 0.016 | 0.019 | 0.18 |
+| 300 | 0.036 | 0.043 | — |
+
+The full likelihood costs O(T·n³) per optimizer evaluation (parallel over
+time blocks) and is skipped above n=100; the composite likelihood scales
+linearly in n.
+
+Real data — CRSP daily returns, the 500 most liquid common shares with a
+complete 2019–2023 history, T=1258 (`benchmarks/bench_crsp.py`):
+`DCC(method="cl")` fits n=500 in ~0.06 s on all cores (~0.4 s on one) with
+a=0.025, b=0.930; with GJR-t margins in ~0.13 s. `loglik_` (and so
+`summary()`) evaluates the full likelihood once — ~0.8 s at n=500.
 
 ## License
 

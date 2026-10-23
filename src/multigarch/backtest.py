@@ -54,6 +54,12 @@ def _hits_array(hits) -> NDArray[np.bool_]:
     return h
 
 
+def _nonneg(lr: float) -> float:
+    """Clip rounding-level negative LR statistics (and -0.0) to 0."""
+    lr = float(lr)
+    return lr if lr > 0.0 else 0.0
+
+
 def kupiec_test(hits, level: float) -> TestResult:
     """Kupiec (1995) proportion-of-failures test of unconditional coverage.
 
@@ -70,7 +76,7 @@ def kupiec_test(hits, level: float) -> TestResult:
     pi = x / n
     ll_null = special.xlogy(n - x, 1.0 - p) + special.xlogy(x, p)
     ll_alt = special.xlogy(n - x, 1.0 - pi) + special.xlogy(x, pi)
-    lr = max(float(-2.0 * (ll_null - ll_alt)), 0.0)
+    lr = _nonneg(-2.0 * (ll_null - ll_alt))
     return TestResult(lr, float(stats.chi2.sf(lr, 1)))
 
 
@@ -104,7 +110,7 @@ def christoffersen_test(hits, level: float) -> tuple[TestResult, TestResult]:
         + special.xlogy(n10, 1.0 - pi1)
         + special.xlogy(n11, pi1)
     )
-    lr_ind = max(float(-2.0 * (ll_null - ll_alt)), 0.0)
+    lr_ind = _nonneg(-2.0 * (ll_null - ll_alt))
     lr_cc = kupiec_test(h, level).statistic + lr_ind
     return (
         TestResult(lr_ind, float(stats.chi2.sf(lr_ind, 1))),

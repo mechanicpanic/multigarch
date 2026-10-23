@@ -43,7 +43,7 @@ dev = ["pytest>=7.0", "ruff>=0.4"]
 packages = ["src/multigarch"]
 
 [tool.hatch.build.targets.sdist]
-only-include = ["src/multigarch", "tests", "benchmarks", "README.md", "LICENSE"]
+only-include = ["src/multigarch", "tests", "benchmarks", "examples", "README.md", "LICENSE"]
 
 [tool.ruff]
 line-length = 100

@@ -27,7 +27,7 @@ jobs:
           version: ">=0.13.4"  # emSign CA removal (certifi 2026.10.19)
           python-version: "3.12"
       - run: uv sync
-      - run: uv run --with pdoc pdoc multigarch --math -t docs/pdoc -o _site
+      - run: uv run --with pdoc pdoc multigarch multigarch.backtest --math -t docs/pdoc -o _site
       - uses: actions/upload-pages-artifact@v3
       - uses: actions/deploy-pages@v4
         id: deployment
