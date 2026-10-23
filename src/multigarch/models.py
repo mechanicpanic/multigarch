@@ -115,11 +115,13 @@ _NU_START = 8.0
 def _garch_starts(p: int, o: int, q: int, dist: str) -> tuple[NDArray[np.float64], int]:
     """Starting points (omega, alpha, g, beta[, eta]) in unit-variance space, one per row.
 
-    Returns (starts, n_always). Higher-order likelihoods (p > 1 or
-    q > 1) are often multimodal, so all their starts always run. For
-    GARCH(1,1) and GJR-GARCH(1,1,1) the extra starts run only if the
-    first fit ends on the boundary: on near-white-noise series the
-    default start leads onto the flat omega-beta ridge.
+    Returns (starts, n_always). All starts always run. GARCH(1,1) and
+    GJR-GARCH(1,1,1) use a high- and a low-persistence start: even
+    order-one likelihoods can be bimodal (one CRSP stock had a second
+    mode 8.6 log-likelihood units better), and on near-white-noise
+    series the default start leads onto the flat omega-beta ridge.
+    Higher orders (p > 1 or q > 1) add starts concentrated on the first
+    and last lags.
     """
     eta = [1.0 / _NU_START] if dist == "t" else []
 
@@ -135,7 +137,7 @@ def _garch_starts(p: int, o: int, q: int, dist: str) -> tuple[NDArray[np.float64
     starts = [x(a0, g0, 0.90, 0.05)]
     if p == 1 and q == 1:
         starts.append(x(0.10 - g0, g0, 0.70, 0.20))
-        return np.array(starts), 1
+        return np.array(starts), len(starts)
     e = 1e-3
 
     def first(k):
