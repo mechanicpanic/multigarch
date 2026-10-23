@@ -31,4 +31,4 @@ Project home: https://github.com/mechanicpanic/multigarch
 from multigarch.models import CCC, DCC, GARCH
 
 __all__ = ["GARCH", "CCC", "DCC"]
-__version__ = "0.2.1"
+__version__ = "0.3.0"

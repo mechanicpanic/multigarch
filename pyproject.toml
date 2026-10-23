@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "multigarch"
-version = "0.2.1"
+version = "0.3.0"
 description = "Simple Multivariate GARCH models (DCC, CCC) for Python"
 readme = "README.md"
 license = "MIT"
@@ -20,6 +20,8 @@ classifiers = [
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Programming Language :: Python :: Free Threading :: 2 - Beta",
 ]
 dependencies = [
     "numpy>=1.24",
