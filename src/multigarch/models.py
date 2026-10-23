@@ -12,6 +12,12 @@ from numpy.typing import NDArray
 from scipy.optimize import minimize
 
 from multigarch._jit import (
+    _ETA_MAX,
+    _ETA_MIN,
+    _MAX_PERSISTENCE,
+    _OMEGA_MIN,
+    DIST_NORMAL,
+    DIST_T,
     dcc_cl_loglik,
     dcc_covariance_loop,
     dcc_final_covariance,
@@ -102,56 +108,87 @@ _FIT_MAXITER = 500
 _FIT_GTOL = 1e-7
 _FIT_FTOL = 1e-10
 
+_DISTS = {"normal": DIST_NORMAL, "t": DIST_T}
+_NU_START = 8.0
 
-def _garch_starts(p: int, q: int) -> tuple[NDArray[np.float64], int]:
-    """Starting points (omega, alpha, beta) in unit-variance space, one per row.
 
-    Returns (starts, n_always). Higher-order likelihoods are often
-    multimodal, so all their starts always run. GARCH(1,1) runs its
-    second, low-persistence start only if the first fit ends on the
-    boundary: on near-white-noise series the default start leads onto
-    the flat omega-beta ridge.
+def _garch_starts(p: int, o: int, q: int, dist: str) -> tuple[NDArray[np.float64], int]:
+    """Starting points (omega, alpha, g, beta[, eta]) in unit-variance space, one per row.
+
+    Returns (starts, n_always). Higher-order likelihoods (p > 1 or
+    q > 1) are often multimodal, so all their starts always run. For
+    GARCH(1,1) and GJR-GARCH(1,1,1) the extra starts run only if the
+    first fit ends on the boundary: on near-white-noise series the
+    default start leads onto the flat omega-beta ridge.
     """
+    eta = [1.0 / _NU_START] if dist == "t" else []
 
-    def x(alpha, beta, omega=0.05):
-        return np.concatenate([[omega], alpha, beta])
+    def x(a_tot, g_tot, b_tot, omega, a_w=None, b_w=None):
+        a = np.full(p, a_tot / p) if a_w is None else a_tot * np.asarray(a_w)
+        g = np.full(o, g_tot / o) if o else np.empty(0)
+        b = np.full(q, b_tot / q) if b_w is None else b_tot * np.asarray(b_w)
+        return np.concatenate([[omega], a, g, b, eta])
 
-    starts = [x(np.full(p, 0.05 / p), np.full(q, 0.90 / q))]
-    if p + q == 2:
-        starts.append(x(np.array([0.10]), np.array([0.70]), omega=0.20))
+    # gamma = 2 g: the default start has gamma ~ 0.04, alpha + gamma/2 ~ 0.05
+    g0 = 0.02 if o else 0.0
+    a0 = 0.05 - g0
+    starts = [x(a0, g0, 0.90, 0.05)]
+    if p == 1 and q == 1:
+        starts.append(x(0.10 - g0, g0, 0.70, 0.20))
         return np.array(starts), 1
     e = 1e-3
+
+    def first(k):
+        return np.r_[1.0, np.full(k - 1, e)]
+
+    def last(k):
+        return np.r_[np.full(k - 1, e), 1.0]
+
     starts += [
-        x(np.r_[0.05, np.full(p - 1, e)], np.r_[0.90, np.full(q - 1, e)]),
-        x(np.r_[np.full(p - 1, e), 0.05], np.r_[np.full(q - 1, e), 0.90]),
-        x(np.full(p, 0.15 / p), np.full(q, 0.60 / q), omega=0.25),
-        x(np.full(p, 0.30 / p), np.full(q, 0.40 / q), omega=0.30),
+        x(a0, g0, 0.90, 0.05, a_w=first(p), b_w=first(q)),
+        x(a0, g0, 0.90, 0.05, a_w=last(p), b_w=last(q)),
+        x(0.15 - g0, g0, 0.60, 0.25),
+        x(0.30 - g0, g0, 0.40, 0.30),
     ]
     return np.array(starts), len(starts)
 
 
-def _garch_slsqp(z: NDArray[np.float64], var0: float, p: int, q: int, x0: NDArray[np.float64]):
+def _garch_slsqp(
+    z: NDArray[np.float64],
+    var0: float,
+    p: int,
+    o: int,
+    q: int,
+    dist: str,
+    x0: NDArray[np.float64],
+):
     """Constrained SLSQP fit in the unit-variance parametrization (fallback)."""
     T = len(z)
+    code = _DISTS[dist]
+    n_coef = p + o + q
 
     def objective(params: NDArray[np.float64]) -> tuple[float, NDArray[np.float64]]:
-        nll, grad = garch_loglik_grad(z, params, p, q, var0)
+        nll, grad = garch_loglik_grad(z, params, p, o, q, code, var0)
         return nll / T, grad / T
 
-    jac_persistence = np.concatenate([[0.0], -np.ones(p + q)])
+    jac_persistence = np.zeros(len(x0))
+    jac_persistence[1 : 1 + n_coef] = -1.0
     constraints = [
         {
             "type": "ineq",
-            "fun": lambda x: 0.999 - np.sum(x[1:]),
+            "fun": lambda x: _MAX_PERSISTENCE - np.sum(x[1 : 1 + n_coef]),
             "jac": lambda x: jac_persistence,
         }
     ]
+    bounds = [(_OMEGA_MIN, None)] + [(0.0, _MAX_PERSISTENCE)] * n_coef
+    if dist == "t":
+        bounds.append((_ETA_MIN, _ETA_MAX))
     return minimize(
         objective,
         x0,
         jac=True,
         method="SLSQP",
-        bounds=[(1e-12, None)] + [(0.0, 0.999)] * (p + q),
+        bounds=bounds,
         constraints=constraints,
         options={"maxiter": 500},
     )
@@ -162,23 +199,34 @@ def _fit_garch_models(
 ) -> list[GARCH]:
     """Fit each model to its series with one parallel numba batch.
 
-    Series where projected BFGS does not converge are refit with SLSQP
-    from its point; a RuntimeWarning is emitted only if that fails too.
+    All models must share (p, o, q, dist). Series where projected BFGS
+    does not converge are refit with SLSQP from its point; a
+    RuntimeWarning is emitted only if that fails too.
     """
     m0 = models[0]
-    p, q = m0.p, m0.q
+    p, o, q, dist = m0.p, m0.o, m0.q, m0.dist
     prepared = [m._prepare(r) for m, r in zip(models, series, strict=True)]
     Z = np.stack([z for _, z, _ in prepared])
     var0 = Z.var(axis=1)
-    starts, n_always = _garch_starts(p, q)
+    starts, n_always = _garch_starts(p, o, q, dist)
     with _numba_threads(n_jobs):
         X, F, conv = garch_fit_batch(
-            Z, starts, p, q, var0, _FIT_MAXITER, _FIT_GTOL, _FIT_FTOL, n_always
+            Z,
+            starts,
+            p,
+            o,
+            q,
+            _DISTS[dist],
+            var0,
+            _FIT_MAXITER,
+            _FIT_GTOL,
+            _FIT_FTOL,
+            n_always,
         )
     for i, (m, (resid, z, scale)) in enumerate(zip(models, prepared, strict=True)):
         x, f, ok = X[i], float(F[i]), bool(conv[i])
         if not ok:
-            result = _garch_slsqp(z, float(var0[i]), p, q, x)
+            result = _garch_slsqp(z, float(var0[i]), p, o, q, dist, x)
             if result.success or result.fun < f:
                 x, f, ok = result.x, float(result.fun), bool(result.success)
             if not ok:
@@ -192,49 +240,88 @@ def _fit_garch_models(
 
 
 def _fit_garch_columns(
-    returns: NDArray[np.float64], p: int, q: int, mean: str, n_jobs: int
+    returns: NDArray[np.float64],
+    p: int,
+    q: int,
+    mean: str,
+    n_jobs: int,
+    o: int = 0,
+    dist: str = "normal",
 ) -> list[GARCH]:
     """Fit a univariate GARCH to every column of a (T, n) array."""
     n = returns.shape[1]
-    models = [GARCH(p=p, q=q, mean=mean) for _ in range(n)]
+    models = [GARCH(p=p, q=q, mean=mean, o=o, dist=dist) for _ in range(n)]
     return _fit_garch_models(models, [returns[:, i] for i in range(n)], n_jobs)
 
 
+def _check_garch_spec(p: int, q: int, o: int, mean: str, dist: str) -> None:
+    if p < 1 or q < 1:
+        raise ValueError("p and q must be >= 1")
+    if o < 0:
+        raise ValueError("o must be >= 0")
+    if mean not in ("zero", "constant"):
+        raise ValueError(f"mean must be 'zero' or 'constant', got {mean!r}")
+    if dist not in _DISTS:
+        raise ValueError(f"dist must be 'normal' or 't', got {dist!r}")
+
+
 class GARCH:
-    r"""Univariate GARCH(p,q) model with JIT-accelerated fitting.
+    r"""Univariate GARCH(p,q) or GJR-GARCH(p,o,q) model with JIT-accelerated fitting.
 
     Model:
 
     $$\sigma^2_t = \omega + \sum_{i=1}^{p} \alpha_i \varepsilon^2_{t-i}
+                 + \sum_{k=1}^{o} \gamma_k \varepsilon^2_{t-k}
+                   \mathbb{1}[\varepsilon_{t-k} < 0]
                  + \sum_{j=1}^{q} \beta_j \sigma^2_{t-j}$$
+
+    with $\varepsilon_t = \sigma_t z_t$ and $z_t$ standard normal or
+    Student-t standardized to unit variance. The asymmetric (GJR) terms
+    let negative shocks raise volatility more than positive ones — the
+    leverage effect typical of equity returns. All coefficients are
+    non-negative and the persistence
+    $\sum\alpha + \sum\beta + \tfrac12\sum\gamma$ is kept below 0.999.
 
     Parameters after fitting:
         omega: long-run variance weight $\omega$
         alpha: ARCH coefficients $\alpha_1, \dots, \alpha_p$
+        gamma: asymmetry coefficients $\gamma_1, \dots, \gamma_o$ (empty if o = 0)
         beta: GARCH coefficients $\beta_1, \dots, \beta_q$
+        nu: Student-t degrees of freedom $\nu > 2$ (None for normal)
     """
 
-    def __init__(self, p: int = 1, q: int = 1, mean: str = "zero") -> None:
-        """Initialize GARCH(p,q) model.
+    def __init__(
+        self,
+        p: int = 1,
+        q: int = 1,
+        mean: str = "zero",
+        o: int = 0,
+        dist: str = "normal",
+    ) -> None:
+        """Initialize a GARCH(p,q) / GJR-GARCH(p,o,q) model.
 
         Args:
             p: ARCH order (number of lagged squared residuals)
             q: GARCH order (number of lagged variances)
             mean: "zero" (default) fits raw returns; "constant" demeans
                 first and stores the sample mean as ``mu``
+            o: asymmetric (GJR) order; 0 (default) is plain GARCH
+            dist: innovation distribution, "normal" (default) or "t"
+                (Student-t with estimated degrees of freedom ``nu``)
         """
-        if p < 1 or q < 1:
-            raise ValueError("p and q must be >= 1")
-        if mean not in ("zero", "constant"):
-            raise ValueError(f"mean must be 'zero' or 'constant', got {mean!r}")
+        _check_garch_spec(p, q, o, mean, dist)
         self.p = p
         self.q = q
+        self.o = o
         self.mean = mean
+        self.dist = dist
         self.mu: float = 0.0
         self._std_err: NDArray[np.float64] | None = None
         self.omega: float | None = None
         self.alpha: NDArray[np.float64] | None = None
+        self.gamma: NDArray[np.float64] | None = None
         self.beta: NDArray[np.float64] | None = None
+        self.nu: float | None = None
         self.resid: NDArray[np.float64] | None = None
         self.sigma2: NDArray[np.float64] | None = None
         self.converged: bool = False
@@ -246,7 +333,7 @@ class GARCH:
         self._T: int = 0
 
     def fit(self, returns: NDArray[np.float64]) -> GARCH:
-        """Fit GARCH(p,q) to return series.
+        """Fit the model to a return series.
 
         Args:
             returns: 1D array of returns
@@ -255,7 +342,7 @@ class GARCH:
             self for chaining
         """
         returns = np.asarray(returns, dtype=np.float64).flatten()
-        _validate_returns(returns, min_obs=max(10, self.p + self.q + 2))
+        _validate_returns(returns, min_obs=max(10, self.p + self.o + self.q + 2))
         return _fit_garch_models([self], [returns], n_jobs=1)[0]
 
     def _prepare(self, returns: NDArray[np.float64]):
@@ -263,8 +350,8 @@ class GARCH:
 
         The optimizer works on unit-variance z: with raw daily returns
         omega is ~1e-6 next to alpha, beta ~0.1, which stalls optimizers
-        far from the optimum. omega scales by scale**2, alpha and beta are
-        scale-free.
+        far from the optimum. omega scales by scale**2; alpha, gamma,
+        beta and nu are scale-free.
         """
         returns = np.asarray(returns, dtype=np.float64).flatten()
         self.mu = float(returns.mean()) if self.mean == "constant" else 0.0
@@ -284,37 +371,55 @@ class GARCH:
         nll_per_obs: float,
         converged: bool,
     ) -> None:
-        """Store a fit given optimal unit-variance params x = (omega_z, alpha, beta)."""
-        p = self.p
+        """Store a fit given optimal unit-variance params x = (omega_z, alpha, g, beta[, eta])."""
+        p, o, q = self.p, self.o, self.q
         T = len(z)
         scale2 = scale * scale
+        x = np.array(x, dtype=np.float64)
         self._std_err = None
         self.converged = converged
         self.omega = float(x[0]) * scale2
-        self.alpha = np.array(x[1 : 1 + p])
-        self.beta = np.array(x[1 + p :])
-        # nll(resid) = nll(z) + T * log(scale)
+        self.alpha = x[1 : 1 + p].copy()
+        self.gamma = 2.0 * x[1 + p : 1 + p + o]
+        self.beta = x[1 + p + o : 1 + p + o + q].copy()
+        self.nu = 1.0 / float(x[1 + p + o + q]) if self.dist == "t" else None
+        # nll(resid) = nll(z) + T * log(scale) (Jacobian of the rescale)
         self._nll = nll_per_obs * T + T * np.log(scale)
         self._z = z
         self._scale = scale
         self._var0 = var0
-        self._x_opt = np.array(x)
+        self._x_opt = x
         self._T = T
         self.resid = resid
-        self.sigma2 = scale2 * garch_variance_loop(z, float(x[0]), self.alpha, self.beta, var0)
+        self.sigma2 = scale2 * garch_variance_loop(z, x, p, o, q, var0)
 
     def _objective(self, x: NDArray[np.float64]) -> float:
         """Negative log-likelihood in the unit-variance parametrization."""
-        return garch_loglik(self._z, x[0], x[1 : 1 + self.p], x[1 + self.p :], self._var0)
+        return garch_loglik(self._z, x, self.p, self.o, self.q, _DISTS[self.dist], self._var0)
 
     @property
     def _n_params(self) -> int:
-        return 1 + self.p + self.q + (1 if self.mean == "constant" else 0)
+        return (
+            1
+            + self.p
+            + self.o
+            + self.q
+            + (1 if self.dist == "t" else 0)
+            + (1 if self.mean == "constant" else 0)
+        )
+
+    @property
+    def persistence(self) -> float:
+        r"""$\sum\alpha + \sum\beta + \tfrac12\sum\gamma$ (variance persistence)."""
+        _check_fitted(self.sigma2 is not None)
+        return float(self.alpha.sum() + self.beta.sum() + 0.5 * self.gamma.sum())
 
     @property
     def loglik_(self) -> float:
-        """Gaussian log-likelihood at the optimum (includes the 2*pi constant)."""
+        """Log-likelihood at the optimum, constants included."""
         _check_fitted(self.sigma2 is not None)
+        if self.dist == "t":
+            return -self._nll
         return -self._nll - 0.5 * self._T * np.log(2.0 * np.pi)
 
     @property
@@ -327,7 +432,7 @@ class GARCH:
 
     @property
     def std_err(self) -> NDArray[np.float64]:
-        """Approximate standard errors for (omega, alpha..., beta...).
+        """Approximate standard errors for (omega, alpha..., gamma..., beta...[, nu]).
 
         Inverse numerical Hessian of the negative log-likelihood at the
         optimum. NaN where the Hessian is not positive definite. The mean
@@ -335,27 +440,39 @@ class GARCH:
         """
         _check_fitted(self.sigma2 is not None)
         if self._std_err is None:
-            # Hessian in the unit-variance parametrization, where all
-            # parameters are O(1); omega = scale**2 * omega_z
+            # Hessian in the internal parametrization, where all parameters
+            # are O(1); map back: omega = scale**2 omega_z, gamma = 2 g,
+            # nu = 1 / eta (delta method)
             H = _numerical_hessian(self._objective, self._x_opt)
             se = _se_from_hessian(H)
             se[0] *= self._scale**2
+            se[1 + self.p : 1 + self.p + self.o] *= 2.0
+            if self.dist == "t":
+                eta = self._x_opt[-1]
+                se[-1] /= eta * eta
             self._std_err = se
         return self._std_err
 
     def summary(self) -> str:
         """Formatted model summary."""
         _check_fitted(self.sigma2 is not None)
-        lines = [f"GARCH({self.p}, {self.q})  T={self._T}  mean={self.mean}"]
+        name = (
+            f"GJR-GARCH({self.p}, {self.o}, {self.q})" if self.o else (f"GARCH({self.p}, {self.q})")
+        )
+        lines = [f"{name}  T={self._T}  mean={self.mean}  dist={self.dist}"]
         if self.mean == "constant":
             lines.append(f"  mu:    {self.mu:.6g}")
         lines.append(f"  omega: {self.omega:.6g}")
         for i, a in enumerate(self.alpha, 1):
             lines.append(f"  alpha[{i}]: {a:.4f}")
+        for k, g in enumerate(self.gamma, 1):
+            lines.append(f"  gamma[{k}]: {g:.4f}")
         for j, b in enumerate(self.beta, 1):
             lines.append(f"  beta[{j}]:  {b:.4f}")
+        if self.dist == "t":
+            lines.append(f"  nu:    {self.nu:.2f}")
         lines += [
-            f"  persistence: {self.alpha.sum() + self.beta.sum():.4f}",
+            f"  persistence: {self.persistence:.4f}",
             f"  loglik: {self.loglik_:.2f}  AIC: {self.aic:.2f}  BIC: {self.bic:.2f}",
             f"  converged: {self.converged}",
         ]
@@ -363,6 +480,10 @@ class GARCH:
 
     def forecast(self, horizon: int = 1) -> NDArray[np.float64]:
         """Forecast conditional variance.
+
+        Future squared shocks are replaced by their expectations:
+        ``E[eps^2] = sigma^2`` and, for symmetric innovations,
+        ``E[eps^2 1(eps < 0)] = sigma^2 / 2``.
 
         Args:
             horizon: number of periods ahead
@@ -372,22 +493,22 @@ class GARCH:
         """
         _check_fitted(self.sigma2 is not None)
 
-        p, q = self.p, self.q
-
-        # Build history arrays for forecasting
-        resid2_hist = list(self.resid[-p:] ** 2)
+        p, o, q = self.p, self.o, self.q
+        lag = max(p, o, 1)
+        e = self.resid[-lag:]
+        e2_hist = list(e**2)
+        neg_hist = list(np.where(e < 0.0, e**2, 0.0))
         sigma2_hist = list(self.sigma2[-q:])
 
         forecasts = np.zeros(horizon)
-
         for h in range(horizon):
-            arch_term = sum(self.alpha[i] * resid2_hist[-(i + 1)] for i in range(p))
+            arch_term = sum(self.alpha[i] * e2_hist[-(i + 1)] for i in range(p))
+            asym_term = sum(self.gamma[k] * neg_hist[-(k + 1)] for k in range(o))
             garch_term = sum(self.beta[j] * sigma2_hist[-(j + 1)] for j in range(q))
-            forecast_h = self.omega + arch_term + garch_term
+            forecast_h = self.omega + arch_term + asym_term + garch_term
             forecasts[h] = forecast_h
-
-            # For future periods, E[ε²] = σ²
-            resid2_hist.append(forecast_h)
+            e2_hist.append(forecast_h)
+            neg_hist.append(0.5 * forecast_h)
             sigma2_hist.append(forecast_h)
 
         return forecasts
@@ -413,6 +534,8 @@ class CCC:
         low_memory: bool = False,
         mean: str = "zero",
         shrinkage: float = 0.0,
+        o: int = 0,
+        dist: str = "normal",
     ) -> None:
         """Initialize CCC-GARCH model.
 
@@ -426,14 +549,19 @@ class CCC:
             shrinkage: shrink the correlation matrix toward identity,
                 R = (1-shrinkage)*S + shrinkage*I. Use > 0 when T is not
                 much larger than n; it guarantees a well-conditioned target
+            o: asymmetric (GJR) order for the univariate models (0 = plain GARCH)
+            dist: innovation distribution for the univariate models,
+                "normal" or "t". The correlation stage is a Gaussian
+                quasi-likelihood on the standardized residuals either way
         """
-        if mean not in ("zero", "constant"):
-            raise ValueError(f"mean must be 'zero' or 'constant', got {mean!r}")
+        _check_garch_spec(p, q, o, mean, dist)
         if not 0.0 <= shrinkage <= 1.0:
             raise ValueError(f"shrinkage must be in [0, 1], got {shrinkage}")
         self.shrinkage = shrinkage
         self.p = p
         self.q = q
+        self.o = o
+        self.dist = dist
         self.mean = mean
         self.n_jobs = n_jobs
         self.low_memory = low_memory
@@ -457,14 +585,16 @@ class CCC:
         returns = np.asarray(returns, dtype=np.float64)
         if returns.ndim == 1:
             returns = returns.reshape(-1, 1)
-        _validate_returns(returns, min_obs=max(10, self.p + self.q + 2))
+        _validate_returns(returns, min_obs=max(10, self.p + self.o + self.q + 2))
 
         T, n = returns.shape
         self._T = T
         self._n_assets = n
 
         # Fit univariate GARCH models in parallel
-        self.garch_models = _fit_garch_columns(returns, self.p, self.q, self.mean, self.n_jobs)
+        self.garch_models = _fit_garch_columns(
+            returns, self.p, self.q, self.mean, self.n_jobs, o=self.o, dist=self.dist
+        )
 
         # Compute standardized residuals
         std_resid = np.zeros((T, n))
@@ -591,6 +721,8 @@ class DCC:
         mean: str = "zero",
         method: str = "auto",
         shrinkage: float = 0.0,
+        o: int = 0,
+        dist: str = "normal",
     ) -> None:
         """Initialize DCC-GARCH model.
 
@@ -609,9 +741,12 @@ class DCC:
             shrinkage: shrink the correlation target toward identity,
                 Q_bar = (1-shrinkage)*S + shrinkage*I. Use > 0 when T is not
                 much larger than n; it guarantees a well-conditioned target
+            o: asymmetric (GJR) order for the univariate models (0 = plain GARCH)
+            dist: innovation distribution for the univariate models,
+                "normal" or "t". The correlation stage is a Gaussian
+                quasi-likelihood on the standardized residuals either way
         """
-        if mean not in ("zero", "constant"):
-            raise ValueError(f"mean must be 'zero' or 'constant', got {mean!r}")
+        _check_garch_spec(p, q, o, mean, dist)
         if method not in ("auto", "full", "cl"):
             raise ValueError(f"method must be 'auto', 'full' or 'cl', got {method!r}")
         if not 0.0 <= shrinkage <= 1.0:
@@ -622,6 +757,8 @@ class DCC:
         self.converged: bool = False
         self.p = p
         self.q = q
+        self.o = o
+        self.dist = dist
         self.mean = mean
         self.n_jobs = n_jobs
         self.low_memory = low_memory
@@ -650,14 +787,16 @@ class DCC:
         returns = np.asarray(returns, dtype=np.float64)
         if returns.ndim == 1:
             returns = returns.reshape(-1, 1)
-        _validate_returns(returns, min_obs=max(10, self.p + self.q + 2))
+        _validate_returns(returns, min_obs=max(10, self.p + self.o + self.q + 2))
 
         T, n = returns.shape
         self._T = T
         self._n_assets = n
 
         # Step 1: Fit univariate GARCH models in parallel
-        self.garch_models = _fit_garch_columns(returns, self.p, self.q, self.mean, self.n_jobs)
+        self.garch_models = _fit_garch_columns(
+            returns, self.p, self.q, self.mean, self.n_jobs, o=self.o, dist=self.dist
+        )
 
         # Compute standardized residuals
         std_resid = np.zeros((T, n), dtype=np.float64)

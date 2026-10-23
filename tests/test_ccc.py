@@ -76,3 +76,8 @@ def test_ccc_diagnostics():
     assert m.bic == pytest.approx(k * np.log(400) - 2 * m.loglik_)
     s = m.summary()
     assert "CCC" in s and "loglik" in s
+
+
+def test_ccc_passes_gjr_t_spec_to_univariate_models():
+    m = CCC(n_jobs=1, o=1, dist="t").fit(np.random.default_rng(61).standard_normal((600, 3)) * 0.01)
+    assert all(g.o == 1 and g.dist == "t" for g in m.garch_models)

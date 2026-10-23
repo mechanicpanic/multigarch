@@ -163,3 +163,10 @@ def test_parallel_fit_matches_serial(n_jobs):
         assert g_p.omega == g_s.omega
         np.testing.assert_array_equal(g_p.sigma2, g_s.sigma2)
     assert (par.a, par.b) == (serial.a, serial.b)
+
+
+def test_dcc_passes_gjr_t_spec_to_univariate_models():
+    returns = simulate_dcc_returns(800, 4, a=0.05, b=0.90, seed=60)
+    m = DCC(n_jobs=1, o=1, dist="t").fit(returns)
+    assert all(g.o == 1 and g.dist == "t" and g.nu is not None for g in m.garch_models)
+    assert np.isfinite(m.loglik_)

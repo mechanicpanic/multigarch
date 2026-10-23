@@ -4,16 +4,22 @@ import numpy as np
 import pytest
 
 from multigarch._jit import (
+    _ETA_MAX,
+    _ETA_MIN,
     _MAX_PERSISTENCE,
+    DIST_NORMAL,
+    DIST_T,
     _projected_gradient_norm,
     dcc_cl_loglik,
     dcc_covariance_loop,
     dcc_final_covariance,
     dcc_loglik_loop,
+    digamma,
     garch_fit_projected,
     garch_loglik,
     garch_loglik_grad,
     garch_project,
+    garch_variance_loop,
 )
 
 
@@ -79,23 +85,76 @@ def test_cl_loglik_single_asset_is_zero():
     assert dcc_cl_loglik(e, np.array([[1.0]]), 0.05, 0.90) == 0.0
 
 
-@pytest.mark.parametrize("pq", [(1, 1), (2, 1), (1, 2), (2, 2)])
-def test_garch_grad_matches_value_and_finite_differences(pq):
-    p, q = pq
+SPECS = [
+    (1, 0, 1, DIST_NORMAL),
+    (2, 0, 1, DIST_NORMAL),
+    (1, 0, 2, DIST_NORMAL),
+    (2, 0, 2, DIST_NORMAL),
+    (1, 1, 1, DIST_NORMAL),
+    (1, 0, 1, DIST_T),
+    (1, 1, 1, DIST_T),
+    (2, 1, 1, DIST_T),
+    (1, 2, 2, DIST_T),
+]
+
+
+def _params(p, o, q, dist):
+    x = [[0.08], np.full(p, 0.04 / p), np.full(o, 0.03 / max(o, 1))[:o], np.full(q, 0.85 / q)]
+    if dist == DIST_T:
+        x.append([1.0 / 7.0])
+    return np.concatenate(x)
+
+
+@pytest.mark.parametrize("spec", SPECS)
+def test_garch_grad_matches_value_and_finite_differences(spec):
+    p, o, q, dist = spec
     rng = np.random.default_rng(5)
     r = rng.standard_normal(300)
     var0 = float(np.var(r))
-    x = np.concatenate([[0.08], np.full(p, 0.06 / p), np.full(q, 0.85 / q)])
+    x = _params(p, o, q, dist)
 
     def f(z):
-        return garch_loglik(r, z[0], z[1 : 1 + p], z[1 + p :], var0)
+        return garch_loglik(r, z, p, o, q, dist, var0)
 
-    val, grad = garch_loglik_grad(r, x, p, q, var0)
+    val, grad = garch_loglik_grad(r, x, p, o, q, dist, var0)
     assert val == pytest.approx(f(x), rel=1e-12)
 
     h = 1e-6
     fd = np.array([(f(x + h * e) - f(x - h * e)) / (2 * h) for e in np.eye(len(x))])
     np.testing.assert_allclose(grad, fd, rtol=1e-5, atol=1e-6)
+
+
+def test_gjr_variance_matches_explicit_recursion():
+    r = np.random.default_rng(13).standard_normal(400)
+    x = np.array([0.06, 0.04, 0.05, 0.85])  # g = gamma / 2 = 0.05
+    s = np.empty(400)
+    s[0] = 1.0
+    for t in range(1, 400):
+        s[t] = (
+            x[0]
+            + x[1] * r[t - 1] ** 2
+            + 2 * x[2] * r[t - 1] ** 2 * (r[t - 1] < 0)
+            + x[3] * s[t - 1]
+        )
+    np.testing.assert_allclose(garch_variance_loop(r, x, 1, 1, 1, 1.0), s, rtol=1e-14)
+
+
+def test_t_loglik_matches_scipy():
+    from scipy import stats
+
+    r = np.random.default_rng(14).standard_normal(400) * 1.3
+    nu = 6.0
+    x = np.array([0.06, 0.04, 0.05, 0.85, 1.0 / nu])
+    s2 = garch_variance_loop(r, x, 1, 1, 1, 1.0)
+    ref = -stats.t.logpdf(r, df=nu, scale=np.sqrt(s2 * (nu - 2) / nu)).sum()
+    assert garch_loglik(r, x, 1, 1, 1, DIST_T, 1.0) == pytest.approx(ref, rel=1e-12)
+
+
+def test_digamma_matches_scipy():
+    from scipy import special
+
+    for v in np.r_[np.linspace(0.05, 3.0, 40), np.linspace(3.0, 300.0, 40)]:
+        assert digamma(v) == pytest.approx(special.digamma(v), rel=1e-11, abs=1e-12)
 
 
 def test_garch_project_matches_brute_force_qp():
@@ -106,7 +165,7 @@ def test_garch_project_matches_brute_force_qp():
         k1 = int(rng.integers(2, 6))
         x = rng.normal(0.3, 0.6, k1)
         out = np.empty(k1)
-        garch_project(x, out)
+        garch_project(x, out, k1 - 1)
         ref = minimize(
             lambda y, x=x: ((y - x) ** 2).sum(),
             np.full(k1, 0.01),
@@ -120,11 +179,21 @@ def test_garch_project_matches_brute_force_qp():
         assert out[1:].sum() <= _MAX_PERSISTENCE + 1e-12
 
 
+def test_garch_project_clips_eta_and_leaves_it_out_of_the_sum():
+    out = np.empty(5)
+    garch_project(np.array([0.1, 0.6, 0.3, 0.4, 0.9]), out, 3)
+    assert out[1:4].sum() == pytest.approx(_MAX_PERSISTENCE)
+    assert out[4] == _ETA_MAX
+    garch_project(np.array([0.1, 0.1, 0.1, 0.1, -1.0]), out, 3)
+    assert out[4] == _ETA_MIN
+
+
 def _fit_projected(r, x0, p, q):
     z = r / r.std()
-    x, f, ok = garch_fit_projected(z, np.asarray(x0, dtype=np.float64), p, q, 1.0, 500, 1e-7, 1e-10)
-    g = garch_loglik_grad(z, x, p, q, 1.0)[1] / len(z)
-    return x, ok, _projected_gradient_norm(x, g, np.empty(len(x)))
+    x0 = np.asarray(x0, dtype=np.float64)
+    x, f, ok = garch_fit_projected(z, x0, p, 0, q, DIST_NORMAL, 1.0, 500, 1e-7, 1e-10)
+    g = garch_loglik_grad(z, x, p, 0, q, DIST_NORMAL, 1.0)[1] / len(z)
+    return x, ok, _projected_gradient_norm(x, g, np.empty(len(x)), p + q)
 
 
 def test_projected_fit_reaches_alpha_boundary_exactly():
