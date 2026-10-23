@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import warnings
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -9,6 +10,7 @@ from contextlib import contextmanager
 import numba
 import numpy as np
 from numpy.typing import NDArray
+from scipy import special, stats
 from scipy.optimize import minimize
 
 from multigarch._jit import (
@@ -267,6 +269,28 @@ def _check_garch_spec(p: int, q: int, o: int, mean: str, dist: str) -> None:
         raise ValueError(f"dist must be 'normal' or 't', got {dist!r}")
 
 
+def _check_level(level: float) -> None:
+    if not 0.0 < level < 1.0:
+        raise ValueError(f"level must be in (0, 1), got {level}")
+
+
+def _std_quantile(dist: str, nu: float | None, prob: float) -> float:
+    """Quantile of the unit-variance innovation distribution."""
+    if dist == "t":
+        return float(special.stdtrit(nu, prob) * np.sqrt((nu - 2.0) / nu))
+    return float(special.ndtri(prob))
+
+
+def _std_tail_mean(dist: str, nu: float | None, level: float) -> float:
+    """E[-z | z <= q_{1-level}] for the unit-variance innovation z (positive)."""
+    a = 1.0 - level
+    if dist == "t":
+        t_a = special.stdtrit(nu, a)
+        tail = stats.t.pdf(t_a, nu) * (nu + t_a * t_a) / ((nu - 1.0) * a)
+        return float(tail * np.sqrt((nu - 2.0) / nu))
+    return float(stats.norm.pdf(special.ndtri(a)) / a)
+
+
 class GARCH:
     r"""Univariate GARCH(p,q) or GJR-GARCH(p,o,q) model with JIT-accelerated fitting.
 
@@ -515,8 +539,185 @@ class GARCH:
 
         return forecasts
 
+    def value_at_risk(self, level: float = 0.99, horizon: int = 1) -> NDArray[np.float64]:
+        r"""One-period value at risk for each of the next ``horizon`` periods.
 
-class CCC:
+        $\mathrm{VaR}_h = -(\mu + \sigma_{T+h}\, q_{1-\text{level}})$, with
+        $q$ the quantile of the fitted innovation distribution (normal, or
+        Student-t standardized to unit variance). Returned as positive
+        losses in return units.
+
+        Args:
+            level: confidence level, e.g. 0.99 for the 1% left tail
+            horizon: number of periods ahead
+
+        Returns:
+            Array of shape (horizon,)
+        """
+        _check_level(level)
+        sigma = np.sqrt(self.forecast(horizon))
+        return -(self.mu + sigma * _std_quantile(self.dist, self.nu, 1.0 - level))
+
+    def expected_shortfall(self, level: float = 0.975, horizon: int = 1) -> NDArray[np.float64]:
+        r"""One-period expected shortfall (CVaR) for each of the next ``horizon`` periods.
+
+        Mean loss beyond the VaR at ``level``:
+        $\mathrm{ES}_h = \sigma_{T+h}\, \mathbb{E}[-z \mid z \le q_{1-\text{level}}] - \mu$,
+        in closed form for both innovation distributions.
+
+        Args:
+            level: confidence level (Basel FRTB uses 0.975)
+            horizon: number of periods ahead
+
+        Returns:
+            Array of shape (horizon,)
+        """
+        _check_level(level)
+        sigma = np.sqrt(self.forecast(horizon))
+        return sigma * _std_tail_mean(self.dist, self.nu, level) - self.mu
+
+    def _refilter(self, returns: NDArray[np.float64]) -> GARCH:
+        """Copy of this model run over new returns with the fitted parameters.
+
+        Recomputes residuals and the variance path only (no re-estimation);
+        enough for forecasting. Likelihood diagnostics are not available on
+        the copy.
+        """
+        _check_fitted(self.sigma2 is not None)
+        new = copy.copy(self)
+        resid = np.asarray(returns, dtype=np.float64).flatten() - self.mu
+        params = np.concatenate([[self.omega], self.alpha, 0.5 * self.gamma, self.beta])
+        new.resid = resid
+        new.sigma2 = garch_variance_loop(
+            resid, params, self.p, self.o, self.q, float(np.var(resid))
+        )
+        new._T = len(resid)
+        new._nll = None
+        new._z = None
+        new._std_err = None
+        return new
+
+
+class _PortfolioRisk:
+    """Covariance forecasts and portfolio risk shared by CCC and DCC.
+
+    Subclasses provide ``_forecast_parts(horizon)`` returning
+    (variance forecasts (horizon, n), correlation forecasts (horizon, n, n)).
+    """
+
+    garch_models: list[GARCH]
+
+    def forecast(self, horizon: int = 1) -> NDArray[np.float64]:
+        """Forecast covariance matrices.
+
+        Args:
+            horizon: number of periods ahead
+
+        Returns:
+            Array of shape (horizon, n_assets, n_assets) of forecasted covariances
+        """
+        var_f, corr_f = self._forecast_parts(horizon)
+        s = np.sqrt(var_f)
+        return corr_f * s[:, :, None] * s[:, None, :]
+
+    def portfolio_value_at_risk(
+        self,
+        weights: NDArray[np.float64],
+        level: float = 0.99,
+        horizon: int = 1,
+        n_sims: int = 20_000,
+        seed: int | None = None,
+    ) -> NDArray[np.float64]:
+        r"""One-period VaR of a portfolio for each of the next ``horizon`` periods.
+
+        Normal margins: closed form,
+        $-(w^\top\mu + \sqrt{w^\top H_{T+h} w}\; z_{1-\text{level}})$.
+        Student-t margins: Monte Carlo with a Gaussian copula — correlated
+        normals with the forecast correlation $R_{T+h}$, mapped to each
+        asset's fitted unit-variance t and scaled by its volatility
+        forecast. Returned as positive losses in return units.
+
+        Args:
+            weights: portfolio weights, shape (n_assets,)
+            level: confidence level, e.g. 0.99
+            horizon: number of periods ahead
+            n_sims: simulations per period (t margins only)
+            seed: random seed (t margins only)
+
+        Returns:
+            Array of shape (horizon,)
+        """
+        return self._portfolio_risk(weights, level, horizon, n_sims, seed)[0]
+
+    def portfolio_expected_shortfall(
+        self,
+        weights: NDArray[np.float64],
+        level: float = 0.975,
+        horizon: int = 1,
+        n_sims: int = 20_000,
+        seed: int | None = None,
+    ) -> NDArray[np.float64]:
+        """One-period expected shortfall of a portfolio; see ``portfolio_value_at_risk``.
+
+        Returns:
+            Array of shape (horizon,)
+        """
+        return self._portfolio_risk(weights, level, horizon, n_sims, seed)[1]
+
+    def _portfolio_risk(
+        self,
+        weights: NDArray[np.float64],
+        level: float,
+        horizon: int,
+        n_sims: int,
+        seed: int | None,
+    ) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
+        _check_level(level)
+        var_f, corr_f = self._forecast_parts(horizon)
+        n = var_f.shape[1]
+        w = np.asarray(weights, dtype=np.float64).reshape(-1)
+        if w.shape != (n,):
+            raise ValueError(f"weights must have shape ({n},), got {w.shape}")
+        mu = np.array([g.mu for g in self.garch_models])
+        sigma = np.sqrt(var_f)
+        a = 1.0 - level
+        var_out = np.empty(horizon)
+        es_out = np.empty(horizon)
+
+        if self.dist == "normal":
+            z = special.ndtri(a)
+            for h in range(horizon):
+                ws = w * sigma[h]
+                sd = float(np.sqrt(ws @ corr_f[h] @ ws))
+                var_out[h] = -(w @ mu + sd * z)
+                es_out[h] = sd * stats.norm.pdf(z) / a - w @ mu
+            return var_out, es_out
+
+        nu = np.array([g.nu for g in self.garch_models])
+        t_scale = np.sqrt((nu - 2.0) / nu)
+        rng = np.random.default_rng(seed)
+        for h in range(horizon):
+            L = _safe_cholesky(corr_f[h])
+            u = special.ndtr(rng.standard_normal((n_sims, n)) @ L.T)
+            eps = special.stdtrit(nu, u) * t_scale
+            loss = -((mu + sigma[h] * eps) @ w)
+            var_out[h] = np.quantile(loss, level)
+            es_out[h] = loss[loss >= var_out[h]].mean()
+        return var_out, es_out
+
+
+def _safe_cholesky(R: NDArray[np.float64]) -> NDArray[np.float64]:
+    """Cholesky of a correlation matrix, clipping negative eigenvalues if needed."""
+    try:
+        return np.linalg.cholesky(R)
+    except np.linalg.LinAlgError:
+        vals, vecs = np.linalg.eigh(R)
+        R = (vecs * np.maximum(vals, 1e-10)) @ vecs.T
+        d = 1.0 / np.sqrt(np.diag(R))
+        return np.linalg.cholesky(R * np.outer(d, d))
+
+
+class CCC(_PortfolioRisk):
     r"""Constant Conditional Correlation GARCH model.
 
     Assumes correlation is constant over time, only variances are dynamic.
@@ -668,34 +869,14 @@ class CCC:
             ]
         )
 
-    def forecast(self, horizon: int = 1) -> NDArray[np.float64]:
-        """Forecast covariance matrices.
-
-        Args:
-            horizon: number of periods ahead
-
-        Returns:
-            Array of shape (horizon, n_assets, n_assets) of forecasted covariances
-        """
+    def _forecast_parts(self, horizon: int) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
+        """Variance forecasts (horizon, n) and the constant correlation (horizon, n, n)."""
         _check_fitted(self.H is not None)
-
-        n = self._n_assets
-        forecasts = np.zeros((horizon, n, n))
-
-        # Forecast individual variances
-        var_forecasts = np.zeros((horizon, n))
-        for i, garch in enumerate(self.garch_models):
-            var_forecasts[:, i] = garch.forecast(horizon)
-
-        # Correlation is constant
-        for h in range(horizon):
-            s = np.sqrt(var_forecasts[h])
-            forecasts[h] = self.R * np.outer(s, s)
-
-        return forecasts
+        var_f = np.column_stack([g.forecast(horizon) for g in self.garch_models])
+        return var_f, np.broadcast_to(self.R, (horizon, *self.R.shape))
 
 
-class DCC:
+class DCC(_PortfolioRisk):
     r"""Dynamic Conditional Correlation GARCH model with JIT acceleration.
 
     Two-step estimation:
@@ -925,39 +1106,27 @@ class DCC:
             ]
         )
 
-    def forecast(self, horizon: int = 1) -> NDArray[np.float64]:
-        """Forecast covariance matrices.
+    def _forecast_parts(self, horizon: int) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
+        r"""Variance forecasts (horizon, n) and correlation forecasts (horizon, n, n).
 
-        Args:
-            horizon: number of periods ahead
-
-        Returns:
-            Array of shape (horizon, n_assets, n_assets) of forecasted covariances
+        The first step uses the last standardized residual,
+        $Q_{T+1} = (1-a-b)\bar{Q} + a\,\varepsilon_T\varepsilon_T' + b\,Q_T$;
+        later steps replace $\varepsilon\varepsilon'$ by its approximate
+        expectation $Q$ (Engle & Sheppard, 2001), so
+        $Q_{T+h} = (1-a-b)\bar{Q} + (a+b)\,Q_{T+h-1}$ reverts to
+        $\bar{Q}$ at rate $a+b$.
         """
         _check_fitted(self.H is not None)
-
         if self.Q_bar is None or self.Q_last is None:
             raise ValueError("Missing DCC state for forecasting")
-
-        n = self._n_assets
-        forecasts = np.zeros((horizon, n, n))
-
-        var_forecasts = np.zeros((horizon, n))
-        for i, garch in enumerate(self.garch_models):
-            var_forecasts[:, i] = garch.forecast(horizon)
-
-        # Forecast Q_t using expected shock term E[εε'] = Q̄
-        Q_forecast = self.Q_last.copy()
-        one_minus_b = 1.0 - self.b
-
+        var_f = np.column_stack([g.forecast(horizon) for g in self.garch_models])
+        a, b = self.a, self.b
+        e = self._std_resid[-1]
+        Q = (1.0 - a - b) * self.Q_bar + a * np.outer(e, e) + b * self.Q_last
+        corr_f = np.empty((horizon, *Q.shape))
         for h in range(horizon):
-            Q_forecast = one_minus_b * self.Q_bar + self.b * Q_forecast
-
-            # Normalize to correlation
-            d = 1.0 / np.sqrt(np.diag(Q_forecast))
-            R_forecast = Q_forecast * np.outer(d, d)
-
-            s = np.sqrt(var_forecasts[h])
-            forecasts[h] = R_forecast * np.outer(s, s)
-
-        return forecasts
+            if h > 0:
+                Q = (1.0 - a - b) * self.Q_bar + (a + b) * Q
+            d = 1.0 / np.sqrt(np.diag(Q))
+            corr_f[h] = Q * np.outer(d, d)
+        return var_f, corr_f
