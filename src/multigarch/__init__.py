@@ -1,6 +1,7 @@
 """Simple multivariate GARCH models for Python.
 
-Univariate `GARCH(p,q)` plus two multivariate correlation models —
+Univariate `GARCH(p,q)` — optionally GJR-asymmetric (`o > 0`) with
+Student-t innovations (`dist="t"`) — plus two multivariate correlation models —
 `CCC` (constant conditional correlation) and `DCC` (dynamic conditional
 correlation) — with numba-JIT inner loops. DCC scales to hundreds of
 assets via a pairwise composite-likelihood estimator (`method="cl"`,
