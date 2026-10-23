@@ -1,11 +1,13 @@
 # multigarch
 
-Multivariate GARCH models for Python: GARCH / GJR-GARCH, CCC and DCC, with
-value at risk and VaR backtesting.
+Multivariate GARCH models for Python: GARCH / GJR-GARCH, CCC, DCC and ADCC,
+with value at risk and VaR backtesting.
 
 - **DCC at hundreds of assets** — composite-likelihood estimation, 500
   stocks in ~0.06 s
-- **GJR asymmetry and Student-t innovations** for the volatility models
+- **Asymmetry where it matters**: GJR volatility (leverage effect),
+  Student-t innovations, and asymmetric DCC — correlations that rise when
+  markets fall together
 - **VaR and expected shortfall** for single assets and portfolios, plus
   rolling backtests with Kupiec and Christoffersen tests
 - **Fast**: numba kernels, parallel across assets, with or without the GIL;
@@ -68,6 +70,7 @@ A complete VaR workflow — model comparison, portfolio VaR, backtest — is in
 | `GARCH(p, q, o=0, dist="normal")` | one series; `o > 0` adds GJR asymmetry (leverage effect), `dist="t"` Student-t innovations |
 | `CCC(...)` | univariate models per asset + constant correlation |
 | `DCC(...)` | univariate models per asset + dynamic correlation (Engle, 2002) |
+| `DCC(asymmetric=True)` | ADCC: correlations react more to joint falls (Cappiello, Engle & Sheppard, 2006) |
 
 Main options (CCC and DCC take the univariate ones too):
 
@@ -77,6 +80,7 @@ Main options (CCC and DCC take the univariate ones too):
 | `dist` | `"normal"` or `"t"` (degrees of freedom estimated) |
 | `mean` | `"zero"` or `"constant"` |
 | `method` (DCC) | `"full"` likelihood, `"cl"` composite likelihood, `"auto"`: `"cl"` for n > 25 |
+| `asymmetric` (DCC) | ADCC: adds the coefficient `g` on joint negative shocks |
 | `shrinkage` | shrink the correlation target toward identity; use when T is not ≫ n |
 | `low_memory` | keep only the final covariance, not the (T, n, n) path |
 | `n_jobs` | numba threads, -1 = all cores |
@@ -104,6 +108,28 @@ CRSP stocks below (`benchmarks/bench_vs_rmgarch.R` and `.py`), seconds:
 Estimates agree, and rmgarch's (a, b) never score better than multigarch's
 on multigarch's second-stage likelihood. rmgarch has no composite
 likelihood, which puts n = 500 out of practical reach.
+
+ADCC (`model = "aDCC"` in rmgarch; pass `aDCC` to the R script):
+
+| n | rmgarch | multigarch, 1 thread | multigarch, all cores | a, b, g rmgarch | a, b, g multigarch |
+|---|---|---|---|---|---|
+| 5 | 0.61 | 0.022 | 0.022 | 0.0077, 0.9545, 0.0199 | 0.0018, 0.9671, 0.0326 |
+| 10 | 0.87 | 0.032 | 0.018 | 0.0071, 0.9719, 0.0105 | 0.0045, 0.9733, 0.0181 |
+| 30 | 2.72 | 0.69 | 0.12 | 0.0046, 0.9669, 0.0060 | 0.0036, 0.9687, 0.0093 |
+| 50 | 6.03 | 1.9 | 0.27 | 0.0031, 0.9514, 0.0056 | 0.0027, 0.9536, 0.0070 |
+| 100 | 44.5 | 5.1 | 0.61 | 0.0034, 0.8512, 0.0061 | 0.0033, 0.8541, 0.0065 |
+
+The ADCC estimates differ by construction: rmgarch builds $\bar N$ as the
+*centered* covariance of the negative shocks, while the model's targeting
+($\mathbb{E}[Q_t] = \bar Q$) requires their second moment
+$\mathbb{E}[n_t n_t']$, which multigarch uses. Given rmgarch's definition,
+multigarch's optimizer reproduces rmgarch's estimates (n = 5:
+0.0077, 0.9546, 0.0197).
+
+A single asymmetry coefficient for many assets has a limit: the
+stationarity bound a + b + δg < 1 tightens as n grows (δ = 0.77 at n = 25,
+2.7 at n = 500 on CRSP). Composite-likelihood ADCC improves AIC over DCC up
+to n ≈ 100 there, but not beyond; multigarch warns when the bound binds.
 
 **Python `arch`** — univariate models only (no multivariate). On 500 CRSP
 stocks (`benchmarks/bench_vs_arch.py`) multigarch fits GARCH(1,1)-normal in

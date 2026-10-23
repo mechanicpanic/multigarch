@@ -23,14 +23,21 @@ from multigarch._jit import (
 )
 
 
-def _numpy_dcc_nll(std_resid, Q_bar, a, b):
-    """Straightforward numpy DCC negative log-likelihood (0.5*(logdet+quad), t>=1)."""
+def _neg_moment(e):
+    neg = np.minimum(e, 0.0)
+    return neg.T @ neg / len(e)
+
+
+def _numpy_dcc_nll(std_resid, Q_bar, a, b, N_bar=None, g=0.0):
+    """Straightforward numpy (A)DCC negative log-likelihood (0.5*(logdet+quad), t>=1)."""
     T, n = std_resid.shape
+    N_bar = np.zeros((n, n)) if N_bar is None else N_bar
     Q = Q_bar.copy()
     nll = 0.0
     for t in range(1, T):
         e = std_resid[t - 1]
-        Q = (1.0 - a - b) * Q_bar + a * np.outer(e, e) + b * Q
+        ne = np.minimum(e, 0.0)
+        Q = (1.0 - a - b) * Q_bar - g * N_bar + a * np.outer(e, e) + g * np.outer(ne, ne) + b * Q
         d = 1.0 / np.sqrt(np.diag(Q))
         R = Q * np.outer(d, d)
         _, logdet = np.linalg.slogdet(R)
@@ -40,29 +47,52 @@ def _numpy_dcc_nll(std_resid, Q_bar, a, b):
 
 
 @pytest.mark.parametrize("n", [2, 4, 7])
-@pytest.mark.parametrize("ab", [(0.05, 0.90), (0.02, 0.97), (0.20, 0.50)])
-def test_full_loglik_matches_numpy_reference(n, ab):
-    a, b = ab
+@pytest.mark.parametrize(
+    "abg", [(0.05, 0.90, 0.0), (0.02, 0.97, 0.0), (0.20, 0.50, 0.0), (0.03, 0.90, 0.04)]
+)
+def test_full_loglik_matches_numpy_reference(n, abg):
+    a, b, g = abg
     rng = np.random.default_rng(2)
     e = rng.standard_normal((60, n))
     Q_bar = np.corrcoef(e.T)
-    val = dcc_loglik_loop(e, Q_bar, a, b)
-    ref = _numpy_dcc_nll(e, Q_bar, a, b)
+    N_bar = _neg_moment(e)
+    val = dcc_loglik_loop(e, Q_bar, N_bar, a, b, g)
+    ref = _numpy_dcc_nll(e, Q_bar, a, b, N_bar, g)
     assert val == pytest.approx(ref, rel=1e-9)
 
 
-def _numpy_cl_nll(e, Q_bar, a, b):
-    """Pairwise composite NLL over contiguous pairs, pure numpy."""
+def _numpy_cl_nll(e, Q_bar, a, b, N_bar=None, g=0.0):
+    """Pairwise composite (A)DCC NLL over contiguous pairs, pure numpy."""
     T, n = e.shape
+    N_bar = np.zeros((n, n)) if N_bar is None else N_bar
+    ne = np.minimum(e, 0.0)
     total = 0.0
     for i in range(n - 1):
         j = i + 1
         qii = qjj = 1.0
         qij = Q_bar[i, j]
         for t in range(1, T):
-            qii = (1 - a - b) + a * e[t - 1, i] ** 2 + b * qii
-            qjj = (1 - a - b) + a * e[t - 1, j] ** 2 + b * qjj
-            qij = (1 - a - b) * Q_bar[i, j] + a * e[t - 1, i] * e[t - 1, j] + b * qij
+            qii = (
+                (1 - a - b)
+                - g * N_bar[i, i]
+                + a * e[t - 1, i] ** 2
+                + g * ne[t - 1, i] ** 2
+                + b * qii
+            )
+            qjj = (
+                (1 - a - b)
+                - g * N_bar[j, j]
+                + a * e[t - 1, j] ** 2
+                + g * ne[t - 1, j] ** 2
+                + b * qjj
+            )
+            qij = (
+                (1 - a - b) * Q_bar[i, j]
+                - g * N_bar[i, j]
+                + a * e[t - 1, i] * e[t - 1, j]
+                + g * ne[t - 1, i] * ne[t - 1, j]
+                + b * qij
+            )
             rho = qij / np.sqrt(qii * qjj)
             om = 1.0 - rho * rho
             total += np.log(om) + (e[t, i] ** 2 + e[t, j] ** 2 - 2 * rho * e[t, i] * e[t, j]) / om
@@ -70,19 +100,21 @@ def _numpy_cl_nll(e, Q_bar, a, b):
 
 
 @pytest.mark.parametrize("n", [2, 5, 12])
-def test_cl_loglik_matches_numpy_reference(n):
+@pytest.mark.parametrize("g", [0.0, 0.04])
+def test_cl_loglik_matches_numpy_reference(n, g):
     rng = np.random.default_rng(3)
     e = rng.standard_normal((80, n))
     Q_bar = np.corrcoef(e.T)
-    val = dcc_cl_loglik(e, Q_bar, 0.05, 0.90)
-    ref = _numpy_cl_nll(e, Q_bar, 0.05, 0.90)
+    N_bar = _neg_moment(e)
+    val = dcc_cl_loglik(e, Q_bar, N_bar, 0.05, 0.88, g)
+    ref = _numpy_cl_nll(e, Q_bar, 0.05, 0.88, N_bar, g)
     assert val == pytest.approx(ref, rel=1e-9)
 
 
 def test_cl_loglik_single_asset_is_zero():
     rng = np.random.default_rng(4)
     e = rng.standard_normal((50, 1))
-    assert dcc_cl_loglik(e, np.array([[1.0]]), 0.05, 0.90) == 0.0
+    assert dcc_cl_loglik(e, np.array([[1.0]]), np.zeros((1, 1)), 0.05, 0.90, 0.0) == 0.0
 
 
 SPECS = [
@@ -228,8 +260,9 @@ def test_dcc_final_covariance_matches_path_last_step(n):
     e = rng.standard_normal((120, n))
     sig = np.abs(rng.standard_normal((120, n))) + 0.1
     Q_bar = np.corrcoef(e.T) if n > 1 else np.ones((1, 1))
-    R, H, Q = dcc_final_covariance(e, sig, Q_bar, 0.04, 0.93)
-    R_path, H_path, Q_path = dcc_covariance_loop(e, sig, Q_bar, 0.04, 0.93)
+    N_bar = _neg_moment(e)
+    R, H, Q = dcc_final_covariance(e, sig, Q_bar, N_bar, 0.04, 0.90, 0.03)
+    R_path, H_path, Q_path = dcc_covariance_loop(e, sig, Q_bar, N_bar, 0.04, 0.90, 0.03)
     np.testing.assert_allclose(Q, Q_path, rtol=1e-12, atol=1e-14)
     np.testing.assert_allclose(R, R_path[-1], rtol=1e-12, atol=1e-14)
     np.testing.assert_allclose(H, H_path[-1], rtol=1e-12, atol=1e-14)
@@ -248,7 +281,7 @@ def test_full_loglik_independent_of_thread_count(n, T):
         vals = set()
         for k in sorted({1, 2, prev}):
             numba.set_num_threads(k)
-            vals.add(dcc_loglik_loop(e, Q_bar, 0.05, 0.90))
+            vals.add(dcc_loglik_loop(e, Q_bar, _neg_moment(e), 0.05, 0.88, 0.03))
     finally:
         numba.set_num_threads(prev)
     assert len(vals) == 1
@@ -258,5 +291,5 @@ def test_full_loglik_finite_for_singular_target():
     rng = np.random.default_rng(12)
     e = rng.standard_normal((200, 5))
     e[:, 4] = e[:, 3]  # rank-deficient Q_bar: the Cholesky pivot floor engages
-    val = dcc_loglik_loop(e, np.corrcoef(e.T), 0.05, 0.90)
+    val = dcc_loglik_loop(e, np.corrcoef(e.T), np.zeros((5, 5)), 0.05, 0.90, 0.0)
     assert np.isfinite(val)

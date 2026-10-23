@@ -1,8 +1,9 @@
-r"""Multivariate GARCH models for Python: GARCH/GJR-GARCH, CCC and DCC, with VaR.
+r"""Multivariate GARCH models for Python: GARCH/GJR-GARCH, CCC, DCC and ADCC, with VaR.
 
 multigarch fits univariate GARCH and GJR-GARCH models (normal or Student-t
-innovations) and two multivariate correlation models on top of them —
-constant (CCC) and dynamic (DCC) conditional correlation. Estimation runs
+innovations) and multivariate correlation models on top of them —
+constant (CCC), dynamic (DCC) and asymmetric dynamic (ADCC) conditional
+correlation. Estimation runs
 in numba, in parallel across assets, and DCC scales to hundreds of assets
 through a composite-likelihood estimator. Value at risk, expected
 shortfall and VaR backtesting are built in.
@@ -74,6 +75,24 @@ $H_t = D_t R_t D_t$ with $D_t = \mathrm{diag}(\sigma_{1,t}, \dots, \sigma_{n,t})
   $$Q_t = (1 - a - b)\,\bar{Q} + a\, e_{t-1} e_{t-1}' + b\, Q_{t-1}, \qquad
     R_t = \mathrm{diag}(Q_t)^{-1/2}\, Q_t\, \mathrm{diag}(Q_t)^{-1/2}$$
   with correlation targeting ($\bar{Q}$ = sample correlation of $e_t$).
+- **ADCC** (Cappiello, Engle & Sheppard, 2006) — `DCC(asymmetric=True)`:
+  $$Q_t = (1 - a - b)\,\bar{Q} - g\,\bar{N} + a\, e_{t-1} e_{t-1}'
+    + g\, n_{t-1} n_{t-1}' + b\, Q_{t-1}$$
+  with $n_t = e_t \odot \mathbb{1}[e_t < 0]$ and $\bar{N}$ their sample
+  second moment $\mathbb{E}[n_t n_t']$. With $g > 0$, assets that fall
+  together become more correlated than assets that rise together — the
+  crisis effect that matters for portfolio VaR. Stationarity:
+  $a + b + \delta g < 1$, $\delta$ the largest eigenvalue of
+  $\bar{Q}^{-1/2}\bar{N}\bar{Q}^{-1/2}$. (R's `rmgarch` uses the
+  *centered* covariance of $n_t$ for $\bar{N}$, which does not keep
+  $\mathbb{E}[Q_t] = \bar{Q}$; its estimates differ accordingly.)
+
+  A single scalar $g$ for many assets has a limit: $\delta$ grows with
+  $n$ (the negative parts share a common mean), so the bound caps $g$ ever
+  harder. On 500 CRSP stocks, composite-likelihood ADCC improves the
+  (full-likelihood) AIC over DCC up to $n \approx 100$, but not at
+  $n = 200$ or $500$, where the bound binds. A `RuntimeWarning` flags a
+  binding bound; at large $n$ compare `aic` with the symmetric model.
 
 DCC's second stage is estimated by one of:
 
@@ -100,6 +119,7 @@ the Gaussian correlation term.
 | one asset, variance or VaR | `GARCH(o=1, dist="t")` (equities); `GARCH()` as a baseline |
 | several assets, correlations roughly stable | `CCC(o=1, dist="t")` |
 | correlations move (crises, regime changes) | `DCC(o=1, dist="t")` |
+| correlations jump when markets fall together | `DCC(o=1, dist="t", asymmetric=True)` (ADCC) |
 | hundreds of assets | `DCC(method="cl", low_memory=True)` |
 
 Compare specifications with `aic` / `bic`, and above all with an
@@ -170,6 +190,9 @@ every `refit_every` steps, and reports the Kupiec (1995) and Christoffersen
 - Bollerslev, T. (1990). Modelling the coherence in short-run nominal
   exchange rates: a multivariate generalized ARCH model. *Review of
   Economics and Statistics*, 72(3), 498–505.
+- Cappiello, L., Engle, R. F., & Sheppard, K. (2006). Asymmetric dynamics
+  in the correlations of global equity and bond returns. *Journal of
+  Financial Econometrics*, 4(4), 537–572.
 - Christoffersen, P. F. (1998). Evaluating interval forecasts.
   *International Economic Review*, 39(4), 841–862.
 - Engle, R. (2002). Dynamic conditional correlation: a simple class of

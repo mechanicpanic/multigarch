@@ -170,3 +170,92 @@ def test_dcc_passes_gjr_t_spec_to_univariate_models():
     m = DCC(n_jobs=1, o=1, dist="t").fit(returns)
     assert all(g.o == 1 and g.dist == "t" and g.nu is not None for g in m.garch_models)
     assert np.isfinite(m.loglik_)
+
+
+def simulate_adcc(T, n, a, b, g, rho=0.4, seed=0):
+    """ADCC returns (unit-variance margins scaled by 0.01) with N_bar from a pilot draw."""
+    rng = np.random.default_rng(seed)
+    Q_bar = np.full((n, n), rho) + (1 - rho) * np.eye(n)
+    pilot = np.minimum(rng.multivariate_normal(np.zeros(n), Q_bar, 100_000), 0.0)
+    N_bar = pilot.T @ pilot / len(pilot)
+    Q = Q_bar.copy()
+    e = np.empty((T, n))
+    for t in range(T):
+        d = 1 / np.sqrt(np.diag(Q))
+        e[t] = np.linalg.cholesky(Q * np.outer(d, d)) @ rng.standard_normal(n)
+        ne = np.minimum(e[t], 0.0)
+        Q = (
+            (1 - a - b) * Q_bar
+            - g * N_bar
+            + a * np.outer(e[t], e[t])
+            + g * np.outer(ne, ne)
+            + b * Q
+        )
+    return 0.01 * e
+
+
+@pytest.fixture(scope="module")
+def adcc_returns():
+    return simulate_adcc(3000, 4, a=0.03, b=0.90, g=0.06, seed=90)
+
+
+@pytest.mark.parametrize("method", ["full", "cl"])
+def test_adcc_recovers_asymmetry(adcc_returns, method):
+    m = DCC(n_jobs=1, method=method, asymmetric=True).fit(adcc_returns)
+    assert m.converged
+    assert abs(m.g - 0.06) < 0.03
+    assert abs(m.b - 0.90) < 0.05
+    assert m.a + m.b + m._delta * m.g < 0.999
+    assert len(m.std_err) == 3
+
+
+def test_adcc_preferred_by_aic_and_nests_dcc(adcc_returns):
+    sym = DCC(n_jobs=1, method="full").fit(adcc_returns)
+    asym = DCC(n_jobs=1, method="full", asymmetric=True).fit(adcc_returns)
+    assert asym.aic < sym.aic
+    assert asym.loglik_ >= sym.loglik_ - 1e-6
+    assert sym.g == 0.0
+    assert "ADCC" in asym.summary() and "g:" in asym.summary()
+
+
+def test_adcc_n_bar_is_the_negative_second_moment(adcc_returns):
+    m = DCC(n_jobs=1, asymmetric=True).fit(adcc_returns)
+    neg = np.minimum(m._std_resid, 0.0)
+    np.testing.assert_allclose(m.N_bar, neg.T @ neg / len(neg), rtol=1e-12)
+    Qh = np.linalg.cholesky(m.Q_bar)
+    M = np.linalg.solve(Qh, np.linalg.solve(Qh, m.N_bar).T)
+    assert m._delta == pytest.approx(np.linalg.eigvalsh(M).max(), rel=1e-9)
+
+
+def test_adcc_first_forecast_step_uses_last_negative_shock(adcc_returns):
+    m = DCC(n_jobs=1, method="full", asymmetric=True).fit(adcc_returns)
+    e = m._std_resid[-1]
+    ne = np.minimum(e, 0.0)
+    Q = (
+        (1 - m.a - m.b) * m.Q_bar
+        - m.g * m.N_bar
+        + m.a * np.outer(e, e)
+        + m.g * np.outer(ne, ne)
+        + m.b * m.Q_last
+    )
+    d = 1 / np.sqrt(np.diag(Q))
+    np.testing.assert_allclose(m._forecast_parts(1)[1][0], Q * np.outer(d, d), rtol=1e-12)
+
+
+def test_adcc_low_memory_matches_path_and_refilter(adcc_returns):
+    full = DCC(n_jobs=1, method="full", asymmetric=True).fit(adcc_returns)
+    lm = DCC(n_jobs=1, method="full", asymmetric=True, low_memory=True).fit(adcc_returns)
+    np.testing.assert_allclose(lm.H, full.H[-1], rtol=1e-10)
+    np.testing.assert_allclose(
+        full._refilter(adcc_returns).forecast(3), full.forecast(3), rtol=1e-10
+    )
+    var = lm.portfolio_value_at_risk(np.full(4, 0.25), 0.99)
+    assert var.shape == (1,) and var[0] > 0
+
+
+def test_adcc_warns_when_stationarity_bound_binds():
+    # weakly correlated assets: delta is large, so g hits the bound
+    r = simulate_adcc(1500, 40, a=0.03, b=0.90, g=0.06, rho=0.05, seed=91)
+    with pytest.warns(RuntimeWarning, match="ADCC stationarity bound is binding"):
+        m = DCC(n_jobs=1, method="cl", asymmetric=True, low_memory=True).fit(r)
+    assert m.a + m.b + m._delta * m.g == pytest.approx(0.999, abs=1e-6)

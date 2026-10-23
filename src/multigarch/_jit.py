@@ -550,6 +550,10 @@ def garch_fit_batch(
     return out, nll, conv
 
 
+# All DCC kernels share the (A)DCC recursion of Cappiello, Engle & Sheppard
+# (2006), with n_t = e_t * 1[e_t < 0]:
+#   Q_t = (1-a-b) Q_bar - g N_bar + a e_{t-1} e_{t-1}' + g n_{t-1} n_{t-1}' + b Q_{t-1}
+# g = 0 with N_bar = 0 is plain DCC, bit for bit.
 # dcc_loglik_loop splits time into this many parallel blocks (fixed, so
 # results are independent of the thread count), keeping a Q snapshot per
 # block start; snapshots are capped in total, which lowers the count at
@@ -562,8 +566,10 @@ _DCC_SNAPSHOT_BYTES = 64 * 1024 * 1024
 def _dcc_nll_block(
     std_resid: np.ndarray,
     Q_bar: np.ndarray,
+    N_bar: np.ndarray,
     a: float,
     b: float,
+    g: float,
     Q: np.ndarray,
     t0: int,
     t1: int,
@@ -584,8 +590,16 @@ def _dcc_nll_block(
     for t in range(t0, t1):
         for i in range(n):
             ei = std_resid[t - 1, i]
+            ni = ei if ei < 0.0 else 0.0
             for j in range(n):
-                Q[i, j] = one_minus_ab * Q_bar[i, j] + a * ei * std_resid[t - 1, j] + b * Q[i, j]
+                ej = std_resid[t - 1, j]
+                nj = ej if ej < 0.0 else 0.0
+                Q[i, j] = (
+                    (one_minus_ab * Q_bar[i, j] - g * N_bar[i, j])
+                    + a * ei * ej
+                    + g * ni * nj
+                    + b * Q[i, j]
+                )
 
         for i in range(n):
             qi = Q[i, i]
@@ -642,8 +656,10 @@ def _dcc_nll_block(
 def dcc_loglik_loop(
     std_resid: np.ndarray,
     Q_bar: np.ndarray,
+    N_bar: np.ndarray,
     a: float,
     b: float,
+    g: float,
 ) -> float:
     """DCC negative log-likelihood: 0.5 * sum_{t>=1}(log|R_t| + e' R_t^-1 e).
 
@@ -662,8 +678,10 @@ def dcc_loglik_loop(
     Args:
         std_resid: Standardized residuals (T, n)
         Q_bar: Unconditional correlation matrix (n, n)
+        N_bar: second moment of the negative parts, E[n n'] (zeros for DCC)
         a: DCC a parameter
         b: DCC b parameter
+        g: ADCC asymmetry parameter (0 for DCC)
 
     Returns:
         Negative log-likelihood
@@ -684,14 +702,18 @@ def dcc_loglik_loop(
         c = np.empty(n)
         q = np.empty(n)
         for j in range(n):
-            c[j] = one_minus_ab * Q_bar[i, j]
+            c[j] = one_minus_ab * Q_bar[i, j] - g * N_bar[i, j]
             q[j] = Q_bar[i, j]
         k = 0
         for t in range(0, starts[nb - 1]):
             if t > 0:
-                ai = a * std_resid[t - 1, i]
+                ei = std_resid[t - 1, i]
+                ai = a * ei
+                gi = g * ei if ei < 0.0 else 0.0
                 for j in range(n):
-                    q[j] = c[j] + ai * std_resid[t - 1, j] + b * q[j]
+                    ej = std_resid[t - 1, j]
+                    nj = ej if ej < 0.0 else 0.0
+                    q[j] = c[j] + ai * ej + gi * nj + b * q[j]
             while k < nb and starts[k] - 1 == t:
                 for j in range(n):
                     snaps[k, i, j] = q[j]
@@ -700,7 +722,9 @@ def dcc_loglik_loop(
     # Pass 2: Cholesky work per time block
     parts = np.empty(nb)
     for k in prange(nb):
-        parts[k] = _dcc_nll_block(std_resid, Q_bar, a, b, snaps[k], starts[k], starts[k + 1])
+        parts[k] = _dcc_nll_block(
+            std_resid, Q_bar, N_bar, a, b, g, snaps[k], starts[k], starts[k + 1]
+        )
 
     ll = 0.0
     for k in range(nb):
@@ -712,8 +736,10 @@ def dcc_loglik_loop(
 def dcc_cl_loglik(
     std_resid: np.ndarray,
     Q_bar: np.ndarray,
+    N_bar: np.ndarray,
     a: float,
     b: float,
+    g: float,
 ) -> float:
     """Pairwise composite negative log-likelihood over contiguous pairs.
 
@@ -725,8 +751,10 @@ def dcc_cl_loglik(
     Args:
         std_resid: Standardized residuals (T, n)
         Q_bar: Unconditional correlation matrix (n, n)
+        N_bar: second moment of the negative parts, E[n n'] (zeros for DCC)
         a: DCC a parameter
         b: DCC b parameter
+        g: ADCC asymmetry parameter (0 for DCC)
 
     Returns:
         Composite negative log-likelihood
@@ -740,6 +768,9 @@ def dcc_cl_loglik(
         i = k
         j = k + 1
         qbar_ij = Q_bar[i, j]
+        cii = one_minus_ab - g * N_bar[i, i]
+        cjj = one_minus_ab - g * N_bar[j, j]
+        cij = one_minus_ab * qbar_ij - g * N_bar[i, j]
         # Q_bar has a unit diagonal, so the diagonal recursions use
         # one_minus_ab directly
         qii = 1.0
@@ -749,9 +780,11 @@ def dcc_cl_loglik(
         for t in range(1, T):
             ei = std_resid[t - 1, i]
             ej = std_resid[t - 1, j]
-            qii = one_minus_ab + a * ei * ei + b * qii
-            qjj = one_minus_ab + a * ej * ej + b * qjj
-            qij = one_minus_ab * qbar_ij + a * ei * ej + b * qij
+            ni = ei if ei < 0.0 else 0.0
+            nj = ej if ej < 0.0 else 0.0
+            qii = cii + a * ei * ei + g * ni * ni + b * qii
+            qjj = cjj + a * ej * ej + g * nj * nj + b * qjj
+            qij = cij + a * ei * ej + g * ni * nj + b * qij
 
             denom = qii * qjj
             if denom < 1e-24:
@@ -776,8 +809,10 @@ def dcc_covariance_loop(
     std_resid: np.ndarray,
     sigmas: np.ndarray,
     Q_bar: np.ndarray,
+    N_bar: np.ndarray,
     a: float,
     b: float,
+    g: float,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Compute DCC correlation and covariance paths.
 
@@ -785,8 +820,10 @@ def dcc_covariance_loop(
         std_resid: Standardized residuals (T, n)
         sigmas: Conditional standard deviations (T, n)
         Q_bar: Unconditional correlation matrix
+        N_bar: second moment of the negative parts, E[n n'] (zeros for DCC)
         a: DCC a parameter
         b: DCC b parameter
+        g: ADCC asymmetry parameter (0 for DCC)
 
     Returns:
         (R, H, Q_last): R and H of shape (T, n, n), Q_last of shape (n, n)
@@ -807,8 +844,16 @@ def dcc_covariance_loop(
     for t in range(1, T):
         for i in range(n):
             ei = std_resid[t - 1, i]
+            ni = ei if ei < 0.0 else 0.0
             for j in range(n):
-                Q[i, j] = one_minus_ab * Q_bar[i, j] + a * ei * std_resid[t - 1, j] + b * Q[i, j]
+                ej = std_resid[t - 1, j]
+                nj = ej if ej < 0.0 else 0.0
+                Q[i, j] = (
+                    (one_minus_ab * Q_bar[i, j] - g * N_bar[i, j])
+                    + a * ei * ej
+                    + g * ni * nj
+                    + b * Q[i, j]
+                )
 
         for i in range(n):
             qi = Q[i, i]
@@ -830,8 +875,10 @@ def dcc_final_covariance(
     std_resid: np.ndarray,
     sigmas: np.ndarray,
     Q_bar: np.ndarray,
+    N_bar: np.ndarray,
     a: float,
     b: float,
+    g: float,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Compute only the final DCC correlation and covariance matrices.
 
@@ -844,8 +891,10 @@ def dcc_final_covariance(
         std_resid: Standardized residuals (T, n)
         sigmas: Conditional standard deviations (T, n)
         Q_bar: Unconditional correlation matrix
+        N_bar: second moment of the negative parts, E[n n'] (zeros for DCC)
         a: DCC a parameter
         b: DCC b parameter
+        g: ADCC asymmetry parameter (0 for DCC)
 
     Returns:
         (R_final, H_final, Q_last), each of shape (n, n)
@@ -863,12 +912,16 @@ def dcc_final_covariance(
                 continue
             m = i + 1
             for j in range(m):
-                c[j] = one_minus_ab * Q_bar[i, j]
+                c[j] = one_minus_ab * Q_bar[i, j] - g * N_bar[i, j]
                 qrow[j] = Q_bar[i, j]
             for t in range(1, T):
-                ai = a * std_resid[t - 1, i]
+                ei = std_resid[t - 1, i]
+                ai = a * ei
+                gi = g * ei if ei < 0.0 else 0.0
                 for j in range(m):
-                    qrow[j] = c[j] + ai * std_resid[t - 1, j] + b * qrow[j]
+                    ej = std_resid[t - 1, j]
+                    nj = ej if ej < 0.0 else 0.0
+                    qrow[j] = c[j] + ai * ej + gi * nj + b * qrow[j]
             for j in range(m):
                 Q[i, j] = qrow[j]
                 Q[j, i] = qrow[j]

@@ -10,7 +10,7 @@ from contextlib import contextmanager
 import numba
 import numpy as np
 from numpy.typing import NDArray
-from scipy import special, stats
+from scipy import linalg, special, stats
 from scipy.optimize import minimize
 
 from multigarch._jit import (
@@ -741,6 +741,16 @@ def _safe_cholesky(R: NDArray[np.float64]) -> NDArray[np.float64]:
         return np.linalg.cholesky(R * np.outer(d, d))
 
 
+def _adcc_delta(N_bar: NDArray[np.float64], Q_bar: NDArray[np.float64]) -> float:
+    """Largest eigenvalue of Q_bar^-1/2 N_bar Q_bar^-1/2 (ADCC stationarity bound)."""
+    try:
+        return max(float(linalg.eigh(N_bar, Q_bar, eigvals_only=True)[-1]), 0.0)
+    except (np.linalg.LinAlgError, linalg.LinAlgError):
+        # singular target: a conservative bound
+        q_min = max(float(np.linalg.eigvalsh(Q_bar)[0]), 1e-12)
+        return float(np.linalg.eigvalsh(N_bar)[-1]) / q_min
+
+
 class CCC(_PortfolioRisk):
     r"""Constant Conditional Correlation GARCH model.
 
@@ -920,6 +930,18 @@ class DCC(_PortfolioRisk):
     likelihood over contiguous pairs $(i, i+1)$ — set `method="cl"` (chosen
     automatically for $n > 25$): $O(Tn)$ per optimizer evaluation instead of
     $O(Tn^3)$, and less biased at large $n$.
+
+    With `asymmetric=True` the model is the asymmetric DCC (ADCC) of
+    Cappiello, Engle & Sheppard (2006):
+
+    $$Q_t = (1 - a - b)\,\bar{Q} - g\,\bar{N} + a\,\varepsilon_{t-1}\varepsilon_{t-1}'
+          + g\,n_{t-1}n_{t-1}' + b\,Q_{t-1}$$
+
+    where $n_t = \varepsilon_t \odot \mathbb{1}[\varepsilon_t < 0]$ and
+    $\bar{N} = \mathbb{E}[n_t n_t']$ (sample second moment), so joint
+    negative shocks raise correlations more than joint positive ones.
+    Stationarity requires $a + b + \delta g < 1$, $\delta$ the largest
+    eigenvalue of $\bar{Q}^{-1/2}\bar{N}\bar{Q}^{-1/2}$.
     """
 
     def __init__(
@@ -933,6 +955,7 @@ class DCC(_PortfolioRisk):
         shrinkage: float = 0.0,
         o: int = 0,
         dist: str = "normal",
+        asymmetric: bool = False,
     ) -> None:
         """Initialize DCC-GARCH model.
 
@@ -955,6 +978,10 @@ class DCC(_PortfolioRisk):
             dist: innovation distribution for the univariate models,
                 "normal" or "t". The correlation stage is a Gaussian
                 quasi-likelihood on the standardized residuals either way
+            asymmetric: fit the asymmetric DCC (ADCC) of Cappiello, Engle &
+                Sheppard (2006): an extra coefficient ``g`` lets joint
+                negative shocks raise correlations more than joint
+                positive ones
         """
         _check_garch_spec(p, q, o, mean, dist)
         if method not in ("auto", "full", "cl"):
@@ -973,8 +1000,12 @@ class DCC(_PortfolioRisk):
         self.n_jobs = n_jobs
         self.low_memory = low_memory
         self.garch_models: list[GARCH] = []
+        self.asymmetric = asymmetric
         self.a: float | None = None
         self.b: float | None = None
+        self.g: float = 0.0
+        self.N_bar: NDArray[np.float64] | None = None
+        self._delta: float = 0.0
         self.Q_bar: NDArray[np.float64] | None = None
         self.R: NDArray[np.float64] | None = None  # (n,n) if low_memory else (T,n,n)
         self.H: NDArray[np.float64] | None = None  # (n,n) if low_memory else (T,n,n)
@@ -1021,6 +1052,14 @@ class DCC(_PortfolioRisk):
         # Step 2: Estimate DCC parameters
         S = np.corrcoef(std_resid.T) if n > 1 else np.array([[1.0]])
         self.Q_bar = (1.0 - self.shrinkage) * S + self.shrinkage * np.eye(n)
+        if self.asymmetric:
+            neg = np.minimum(std_resid, 0.0)
+            self.N_bar = neg.T @ neg / T
+            self._delta = _adcc_delta(self.N_bar, self.Q_bar)
+        else:
+            self.N_bar = np.zeros((n, n))
+            self._delta = 0.0
+        N_bar, delta = self.N_bar, self._delta
 
         method = self.method
         if method == "auto":
@@ -1035,11 +1074,19 @@ class DCC(_PortfolioRisk):
         denom = max(float((T - 1) * (n - 1 if method == "cl" else 1)), 1.0)
 
         def objective(params: NDArray[np.float64]) -> float:
-            return loglik_fn(std_resid, self.Q_bar, params[0], params[1]) / denom
+            g = params[2] if self.asymmetric else 0.0
+            return loglik_fn(std_resid, self.Q_bar, N_bar, params[0], params[1], g) / denom
 
-        x0 = np.array([0.05, 0.90])
-        bounds = [(1e-8, 0.999), (1e-8, 0.999)]
-        constraints = [{"type": "ineq", "fun": lambda x: 0.999 - x[0] - x[1]}]
+        # Stationarity (and a positive definite intercept for ADCC):
+        # a + b + delta * g < 1, delta = max eig of Q_bar^-1/2 N_bar Q_bar^-1/2
+        if self.asymmetric:
+            x0 = np.array([0.03, 0.90, 0.01])
+            bounds = [(1e-8, 0.999), (1e-8, 0.999), (0.0, 0.999)]
+            constraints = [{"type": "ineq", "fun": lambda x: 0.999 - x[0] - x[1] - delta * x[2]}]
+        else:
+            x0 = np.array([0.05, 0.90])
+            bounds = [(1e-8, 0.999), (1e-8, 0.999)]
+            constraints = [{"type": "ineq", "fun": lambda x: 0.999 - x[0] - x[1]}]
 
         with _numba_threads(self.n_jobs):
             result = minimize(
@@ -1058,23 +1105,33 @@ class DCC(_PortfolioRisk):
                 )
             self.converged = bool(result.success)
             self.a, self.b = float(result.x[0]), float(result.x[1])
+            self.g = float(result.x[2]) if self.asymmetric else 0.0
+            if self.asymmetric and self.a + self.b + delta * self.g > 0.995:
+                warnings.warn(
+                    f"ADCC stationarity bound is binding: a + b + delta*g = "
+                    f"{self.a + self.b + delta * self.g:.4f} with delta = {delta:.2f}. "
+                    "delta grows with the number of assets, which caps the asymmetry g; "
+                    "compare aic with the symmetric DCC",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
 
             # Compute covariance matrices
             if self.low_memory:
                 self.R, self.H, self.Q_last = dcc_final_covariance(
-                    std_resid, sigmas, self.Q_bar, self.a, self.b
+                    std_resid, sigmas, self.Q_bar, N_bar, self.a, self.b, self.g
                 )
             else:
                 self.R, self.H, self.Q_last = dcc_covariance_loop(
-                    std_resid, sigmas, self.Q_bar, self.a, self.b
+                    std_resid, sigmas, self.Q_bar, N_bar, self.a, self.b, self.g
                 )
 
         return self
 
     @property
     def _n_params(self) -> int:
-        """Optimizer-estimated parameters: univariate + (a, b). Q_bar is targeted."""
-        return sum(g._n_params for g in self.garch_models) + 2
+        """Optimizer-estimated parameters: univariate + (a, b[, g]). Q_bar, N_bar are targeted."""
+        return sum(m._n_params for m in self.garch_models) + (3 if self.asymmetric else 2)
 
     @property
     def loglik_(self) -> float:
@@ -1087,7 +1144,9 @@ class DCC(_PortfolioRisk):
         """
         _check_fitted(self.H is not None)
         if self._loglik is None:
-            corr_nll = dcc_loglik_loop(self._std_resid, self.Q_bar, self.a, self.b)
+            corr_nll = dcc_loglik_loop(
+                self._std_resid, self.Q_bar, self.N_bar, self.a, self.b, self.g
+            )
             sum_ee = float((self._std_resid[1:] ** 2).sum())
             corr_ll = -corr_nll + 0.5 * sum_ee
             self._loglik = sum(g.loglik_ for g in self.garch_models) + corr_ll
@@ -1103,7 +1162,7 @@ class DCC(_PortfolioRisk):
 
     @property
     def std_err(self) -> NDArray[np.float64]:
-        """Approximate standard errors for (a, b).
+        """Approximate standard errors for (a, b), and g for ADCC.
 
         Inverse numerical Hessian of the second-stage objective actually
         used for estimation (full or composite). Both ignore first-stage
@@ -1114,9 +1173,11 @@ class DCC(_PortfolioRisk):
             loglik_fn = dcc_cl_loglik if self.method_ == "cl" else dcc_loglik_loop
 
             def f(x: NDArray[np.float64]) -> float:
-                return loglik_fn(self._std_resid, self.Q_bar, x[0], x[1])
+                g = x[2] if self.asymmetric else 0.0
+                return loglik_fn(self._std_resid, self.Q_bar, self.N_bar, x[0], x[1], g)
 
-            H = _numerical_hessian(f, np.array([self.a, self.b]))
+            x = [self.a, self.b] + ([self.g] if self.asymmetric else [])
+            H = _numerical_hessian(f, np.array(x))
             self._std_err = _se_from_hessian(H)
         return self._std_err
 
@@ -1125,8 +1186,14 @@ class DCC(_PortfolioRisk):
         _check_fitted(self.H is not None)
         return "\n".join(
             [
-                f"DCC({self.p}, {self.q})  T={self._T}  n={self._n_assets}  method={self.method_}",
-                f"  a: {self.a:.4f}  b: {self.b:.4f}  a+b: {self.a + self.b:.4f}",
+                f"{'ADCC' if self.asymmetric else 'DCC'}({self.p}, {self.q})  T={self._T}"
+                f"  n={self._n_assets}  method={self.method_}",
+                (
+                    f"  a: {self.a:.4f}  b: {self.b:.4f}  g: {self.g:.4f}"
+                    f"  a+b+delta*g: {self.a + self.b + self._delta * self.g:.4f}"
+                    if self.asymmetric
+                    else f"  a: {self.a:.4f}  b: {self.b:.4f}  a+b: {self.a + self.b:.4f}"
+                ),
                 f"  shrinkage: {self.shrinkage}",
                 f"  loglik: {self.loglik_:.2f}  AIC: {self.aic:.2f}  BIC: {self.bic:.2f}",
                 f"  converged: {self.converged}",
@@ -1136,7 +1203,7 @@ class DCC(_PortfolioRisk):
     def _advance_state(self, sigmas: NDArray[np.float64]) -> None:
         with _numba_threads(self.n_jobs):
             self.R, self.H, self.Q_last = dcc_final_covariance(
-                self._std_resid, sigmas, self.Q_bar, self.a, self.b
+                self._std_resid, sigmas, self.Q_bar, self.N_bar, self.a, self.b, self.g
             )
 
     def _forecast_parts(self, horizon: int) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
@@ -1153,9 +1220,16 @@ class DCC(_PortfolioRisk):
         if self.Q_bar is None or self.Q_last is None:
             raise ValueError("Missing DCC state for forecasting")
         var_f = np.column_stack([g.forecast(horizon) for g in self.garch_models])
-        a, b = self.a, self.b
+        a, b, g = self.a, self.b, self.g
         e = self._std_resid[-1]
-        Q = (1.0 - a - b) * self.Q_bar + a * np.outer(e, e) + b * self.Q_last
+        n_e = np.minimum(e, 0.0)
+        Q = (
+            (1.0 - a - b) * self.Q_bar
+            - g * self.N_bar
+            + a * np.outer(e, e)
+            + g * np.outer(n_e, n_e)
+            + b * self.Q_last
+        )
         corr_f = np.empty((horizon, *Q.shape))
         for h in range(horizon):
             if h > 0:

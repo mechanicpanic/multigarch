@@ -6,8 +6,9 @@
 1. Compare GARCH / GJR-GARCH with normal and Student-t innovations on one
    asset by AIC.
 2. Backtest their 99% one-day VaR out of sample (rolling window).
-3. Fit DCC with GJR-t margins to all assets and forecast portfolio VaR
-   and expected shortfall for the next days.
+3. Fit DCC with GJR-t margins to all assets, test for asymmetric
+   correlations (ADCC), and forecast portfolio VaR and expected
+   shortfall for the next days.
 4. Backtest the portfolio VaR.
 """
 
@@ -82,7 +83,10 @@ def main(returns: np.ndarray, window: int = 1000, level: float = 0.99, refit_eve
     t0 = time.perf_counter()
     dcc = DCC(o=1, dist="t", low_memory=True).fit(returns)
     print(f"\n3. DCC with GJR-t margins, equal-weight portfolio ({time.perf_counter() - t0:.2f} s)")
-    print(f"   a={dcc.a:.4f}  b={dcc.b:.4f}")
+    print(f"   a={dcc.a:.4f}  b={dcc.b:.4f}  AIC={dcc.aic:.1f}")
+    adcc = DCC(o=1, dist="t", low_memory=True, asymmetric=True).fit(returns)
+    better = "ADCC" if adcc.aic < dcc.aic else "DCC"
+    print(f"   ADCC: g={adcc.g:.4f}  AIC={adcc.aic:.1f}  -> {better} preferred")
     var = dcc.portfolio_value_at_risk(weights, level, horizon=5, seed=1)
     es = dcc.portfolio_expected_shortfall(weights, 0.975, horizon=5, seed=1)
     for h in range(5):
