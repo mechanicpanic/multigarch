@@ -647,7 +647,8 @@ class _PortfolioRisk:
         Returns:
             Array of shape (horizon,)
         """
-        return self._portfolio_risk(weights, level, horizon, n_sims, seed)[0]
+        var, _ = self._portfolio_risk(weights, (level,), horizon, n_sims, seed)
+        return var[0]
 
     def portfolio_expected_shortfall(
         self,
@@ -662,35 +663,37 @@ class _PortfolioRisk:
         Returns:
             Array of shape (horizon,)
         """
-        return self._portfolio_risk(weights, level, horizon, n_sims, seed)[1]
+        _, es = self._portfolio_risk(weights, (level,), horizon, n_sims, seed)
+        return es[0]
 
     def _portfolio_risk(
         self,
         weights: NDArray[np.float64],
-        level: float,
+        levels: tuple[float, ...],
         horizon: int,
         n_sims: int,
         seed: int | None,
     ) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
-        _check_level(level)
+        """(VaR, ES), each (len(levels), horizon); one simulation serves all levels."""
+        for level in levels:
+            _check_level(level)
         var_f, corr_f = self._forecast_parts(horizon)
         n = var_f.shape[1]
         w = np.asarray(weights, dtype=np.float64).reshape(-1)
         if w.shape != (n,):
             raise ValueError(f"weights must have shape ({n},), got {w.shape}")
-        mu = np.array([g.mu for g in self.garch_models])
+        mu_p = float(w @ np.array([g.mu for g in self.garch_models]))
         sigma = np.sqrt(var_f)
-        a = 1.0 - level
-        var_out = np.empty(horizon)
-        es_out = np.empty(horizon)
+        var_out = np.empty((len(levels), horizon))
+        es_out = np.empty((len(levels), horizon))
 
         if self.dist == "normal":
-            z = special.ndtri(a)
             for h in range(horizon):
                 ws = w * sigma[h]
                 sd = float(np.sqrt(ws @ corr_f[h] @ ws))
-                var_out[h] = -(w @ mu + sd * z)
-                es_out[h] = sd * stats.norm.pdf(z) / a - w @ mu
+                for k, level in enumerate(levels):
+                    var_out[k, h] = sd * _std_quantile("normal", None, level) - mu_p
+                    es_out[k, h] = sd * _std_tail_mean("normal", None, level) - mu_p
             return var_out, es_out
 
         nu = np.array([g.nu for g in self.garch_models])
@@ -700,10 +703,31 @@ class _PortfolioRisk:
             L = _safe_cholesky(corr_f[h])
             u = special.ndtr(rng.standard_normal((n_sims, n)) @ L.T)
             eps = special.stdtrit(nu, u) * t_scale
-            loss = -((mu + sigma[h] * eps) @ w)
-            var_out[h] = np.quantile(loss, level)
-            es_out[h] = loss[loss >= var_out[h]].mean()
+            loss = -((sigma[h] * eps) @ w) - mu_p
+            for k, level in enumerate(levels):
+                var_out[k, h] = np.quantile(loss, level)
+                es_out[k, h] = loss[loss >= var_out[k, h]].mean()
         return var_out, es_out
+
+    def _refilter(self, returns: NDArray[np.float64]):
+        """Copy of this model run over new (T, n) returns with the fitted parameters.
+
+        Univariate variance paths are recomputed with fixed GARCH parameters;
+        the correlation model keeps its fitted parameters and target and
+        only its state is advanced. Final-step matrices only (as with
+        ``low_memory=True``); likelihood diagnostics are not available.
+        """
+        _check_fitted(self.H is not None)
+        returns = np.asarray(returns, dtype=np.float64)
+        new = copy.copy(self)
+        new.garch_models = [g._refilter(returns[:, i]) for i, g in enumerate(self.garch_models)]
+        sigmas = np.sqrt(np.column_stack([g.sigma2 for g in new.garch_models]))
+        new._std_resid = np.column_stack([g.resid for g in new.garch_models]) / sigmas
+        new._T = returns.shape[0]
+        new._loglik = None
+        new.low_memory = True
+        new._advance_state(sigmas)
+        return new
 
 
 def _safe_cholesky(R: NDArray[np.float64]) -> NDArray[np.float64]:
@@ -868,6 +892,9 @@ class CCC(_PortfolioRisk):
                 f"  loglik: {self.loglik_:.2f}  AIC: {self.aic:.2f}  BIC: {self.bic:.2f}",
             ]
         )
+
+    def _advance_state(self, sigmas: NDArray[np.float64]) -> None:
+        self.H = self.R * np.outer(sigmas[-1], sigmas[-1])
 
     def _forecast_parts(self, horizon: int) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
         """Variance forecasts (horizon, n) and the constant correlation (horizon, n, n)."""
@@ -1105,6 +1132,12 @@ class DCC(_PortfolioRisk):
                 f"  converged: {self.converged}",
             ]
         )
+
+    def _advance_state(self, sigmas: NDArray[np.float64]) -> None:
+        with _numba_threads(self.n_jobs):
+            self.R, self.H, self.Q_last = dcc_final_covariance(
+                self._std_resid, sigmas, self.Q_bar, self.a, self.b
+            )
 
     def _forecast_parts(self, horizon: int) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
         r"""Variance forecasts (horizon, n) and correlation forecasts (horizon, n, n).
